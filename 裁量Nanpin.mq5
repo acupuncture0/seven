@@ -1,6 +1,6 @@
 //+------------------------------------------------------------------+
 //|                                                 裁量Nanpin.mq5   |
-//|   裁量Nanpin  v4.20                                               |
+//|   裁量Nanpin  v4.21                                               |
 //|   ・レート予約：SELL／BUY 各3つの入力ボックス。到達で成行＋指値     |
 //|                                                                  |
 //|   【エントリー】                                                  |
@@ -28,7 +28,7 @@
 //|   ・銘柄のサフィックス有無（XAUUSD／XAUUSDx／XAUUSD-m 等）を同一視  |
 //+------------------------------------------------------------------+
 #property copyright "KOHI"
-#property version   "4.20"
+#property version   "4.21"
 //--- 説明文（#property description）は MetaEditor のプロジェクト（.mqproj）側の設定と
 //--- 重複して警告が出るため記載していません。使い方は設定ガイドを参照してください。
 
@@ -209,15 +209,15 @@ double            g_balanceBefore[2];
 double            g_triggerProfit[2];
 int               g_closedCount[2];
 int               g_deletedCount[2];
-uint              g_lastTryMs[2];
-uint              g_lastLockMs[2];
+ulong             g_lastTryMs[2];
+ulong             g_lastLockMs[2];
 
 //--- グリッド
 double            g_gridTP[2];
 double            g_gridStep[2];
 datetime          g_gridTime[2];
 datetime          g_lastBarTime    = 0;
-uint              g_lastManageMs   = 0;
+ulong             g_lastManageMs   = 0;
 
 //--- インジケーター
 ENUM_TIMEFRAMES   g_entryTF        = PERIOD_CURRENT;
@@ -230,7 +230,7 @@ datetime          g_armUsed[2];                        // 順張り：使用済�
 #define RES_SLOTS    3
 double            g_resRate[2][RES_SLOTS];             // レート予約（0＝未設定）
 int               g_resDir[2][RES_SLOTS];              // 1＝上昇して到達、-1＝下落して到達
-uint              g_lastTrendMs    = 0;
+ulong             g_lastTrendMs    = 0;
 //--- BB幅ブレイク
 #define SQZ_LOOKBACK 300                               // BB幅の局面判定に使う確定足の本数
 datetime          g_sqzBarTime     = 0;                // 局面を計算した足
@@ -240,13 +240,18 @@ int               g_sqzConfirmShift = -1;              // 転換が確定した�
 datetime          g_sqzEntryUsed   = 0;                // エントリー済みの拡大局面（転換足の時刻）
 datetime          g_sqzExitUsed    = 0;                // 決済済みの縮小局面（転換足の時刻）
 bool              g_sqzExitPending = false;            // 全決済の残りをリトライ中
-uint              g_lastSqzMs      = 0;
+ulong             g_lastSqzMs      = 0;
 int               g_hATRH          = INVALID_HANDLE;
 double            g_pip            = 0.1;
 string            g_bbName         = "";
 int               g_bbWin          = -1;
 string            g_atrName        = "";
 int               g_atrWin         = -1;
+
+//--- 実行環境（バックテストの軽量化）
+bool              g_tester         = false;            // ストラテジーテスター
+bool              g_noPanel        = false;            // パネルを描かない（ビジュアルモードでないテスター）
+ulong             g_lastPanelMs    = 0;
 
 int               g_failPrintCount = 0;
 string            g_lastEvent      = "";
@@ -264,6 +269,9 @@ double            g_commVal[];
 //+------------------------------------------------------------------+
 int OnInit()
   {
+   g_tester  = (bool)MQLInfoInteger(MQL_TESTER);
+   g_noPanel = g_tester && !(bool)MQLInfoInteger(MQL_VISUAL_MODE);
+
    if(InpLot <= 0 || InpGridCount < 0 || InpGridStep <= 0 || InpMicroTP <= 0 || InpBBPeriod < 2 || InpATRPeriod < 1 || InpMaxGridsPerSide < 1 ||
       InpTrendEntryDev <= 0 || InpTrendEntryDev >= InpBBDev || InpTrendLookback < 0 ||
       InpSqzEntryDev <= 0 || InpSqzConfirmBars < 1 || InpSqzConfirmBars > 50)
@@ -290,16 +298,20 @@ int OnInit()
          g_initAmount = InpSL_Other;
    g_initAmount = MathAbs(g_initAmount);
 
-//--- インジケーター
+//--- インジケーター（使う方式・機能の分だけ作成：バックテストの軽量化）
    g_entryTF = (InpEntryTF == PERIOD_CURRENT) ? (ENUM_TIMEFRAMES)_Period : InpEntryTF;
+   bool needE  = (InpEntryMode == ENTRY_TREND);
+   bool needS  = (InpEntryMode == ENTRY_SQUEEZE);
+   bool needH  = UseHTFFilter();
+   bool needAH = !g_noPanel;   // 上位足ATRはパネル表示のみで使用
    g_hBB   = iBands(_Symbol, g_entryTF, InpBBPeriod, 0, InpBBDev, PRICE_CLOSE);
    g_hATR  = iATR(_Symbol, g_entryTF, InpATRPeriod);
-   g_hBBH  = iBands(_Symbol, InpHTF, InpHTFBBPeriod, 0, InpHTFBBDev, PRICE_CLOSE);
-   g_hATRH = iATR(_Symbol, InpHTF, InpATRPeriod);
-   g_hBBE  = iBands(_Symbol, g_entryTF, InpBBPeriod, 0, InpTrendEntryDev, PRICE_CLOSE);
-   g_hBBS  = iBands(_Symbol, g_entryTF, InpBBPeriod, 0, InpSqzEntryDev, PRICE_CLOSE);
-   if(g_hBB == INVALID_HANDLE || g_hATR == INVALID_HANDLE || g_hBBH == INVALID_HANDLE || g_hATRH == INVALID_HANDLE || g_hBBE == INVALID_HANDLE ||
-      g_hBBS == INVALID_HANDLE)
+   g_hBBH  = needH  ? iBands(_Symbol, InpHTF, InpHTFBBPeriod, 0, InpHTFBBDev, PRICE_CLOSE) : INVALID_HANDLE;
+   g_hATRH = needAH ? iATR(_Symbol, InpHTF, InpATRPeriod) : INVALID_HANDLE;
+   g_hBBE  = needE  ? iBands(_Symbol, g_entryTF, InpBBPeriod, 0, InpTrendEntryDev, PRICE_CLOSE) : INVALID_HANDLE;
+   g_hBBS  = needS  ? iBands(_Symbol, g_entryTF, InpBBPeriod, 0, InpSqzEntryDev, PRICE_CLOSE) : INVALID_HANDLE;
+   if(g_hBB == INVALID_HANDLE || g_hATR == INVALID_HANDLE || (needH && g_hBBH == INVALID_HANDLE) ||
+      (needAH && g_hATRH == INVALID_HANDLE) || (needE && g_hBBE == INVALID_HANDLE) || (needS && g_hBBS == INVALID_HANDLE))
      {
       Print(LOG_TAG + "インジケーターを作成できませんでした。");
       return(INIT_FAILED);
@@ -368,12 +380,13 @@ int OnInit()
 
    g_gvBase = "7HA_" + IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)) + "_" +
               g_targetCore + "_" + IntegerToString(InpMagic);
-   LoadState();
+   if(!g_tester)
+      LoadState();   // テスターでは毎回まっさらな状態から始める
 
 //--- 起動直後の足ではエントリーしない
    g_lastBarTime = iTime(_Symbol, g_entryTF, 0);
 
-   PrintFormat("%s起動 v4.20：口座通貨=%s／自動化=%s／方式=%s／BB幅縮小で全決済=%s／エントリー足=%s／上位足=%s／SELL損切り=%s／BUY損切り=%s／監視Magic=%s／銘柄=%s",
+   PrintFormat("%s起動 v4.21：口座通貨=%s／自動化=%s／方式=%s／BB幅縮小で全決済=%s／エントリー足=%s／上位足=%s／SELL損切り=%s／BUY損切り=%s／監視Magic=%s／銘柄=%s",
                LOG_TAG, g_currency, AutoModeText(g_autoMode), EntryModeText(), (InpSqzExit ? "ON" : "OFF"), TFName(g_entryTF),
                (UseHTFFilter() ? TFName(InpHTF) : "OFF"),
                FormatMoney(g_slAmt[SIDE_SELL]), FormatMoney(g_slAmt[SIDE_BUY]),
@@ -382,8 +395,10 @@ int OnInit()
       if(g_locked[s])
          Print(LOG_TAG + SideName(s) + "はロック中です（前回の損切り後、未解除）。");
 
-   CreatePanel();
-   EventSetMillisecondTimer(500);
+   if(!g_noPanel)
+      CreatePanel();
+   if(!g_tester)
+      EventSetMillisecondTimer(500);   // テスターではティックだけで十分（タイマー分の処理を省く）
    MainLoop();
    return(INIT_SUCCEEDED);
   }
@@ -435,7 +450,24 @@ void MainLoop()
    CheckSqueeze();   // 2'') BB幅ブレイク：拡大転換でエントリー／縮小転換で全決済
    CheckReservations(); // 2''') レート予約の到達チェック
    ManageOwn();      // 3) 自EAポジションの微益利確・最有利ポジ管理
-   RefreshPanel();
+   RefreshPanel(false);
+  }
+
+//+------------------------------------------------------------------+
+//| 判定の間引き用の時刻（ミリ秒）                                    |
+//|   テスターではシミュレーション上のティック時刻を使う                |
+//|   （実時間を使うと、高速なテストで判定が何時間分も飛ばされるため）   |
+//+------------------------------------------------------------------+
+ulong NowMs()
+  {
+   if(g_tester)
+     {
+      MqlTick tk;
+      if(SymbolInfoTick(_Symbol, tk))
+         return((ulong)tk.time_msc);
+      return((ulong)TimeCurrent() * 1000);
+     }
+   return(GetTickCount64());
   }
 
 //+------------------------------------------------------------------+
@@ -516,7 +548,7 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam, const 
         }
      }
 
-   RefreshPanel();
+   RefreshPanel(true);
   }
 
 //+------------------------------------------------------------------+
@@ -574,7 +606,7 @@ void CheckTrendEntry()
   {
    if(InpEntryMode != ENTRY_TREND)
       return;
-   uint now = GetTickCount();
+   ulong now = NowMs();
    if(g_lastTrendMs != 0 && (now - g_lastTrendMs) < 250)
       return;
    g_lastTrendMs = now;
@@ -693,16 +725,12 @@ void CheckSqueeze()
   {
    if(InpEntryMode != ENTRY_SQUEEZE && !InpSqzExit)
       return;
-   uint now = GetTickCount();
-   if(g_lastSqzMs != 0 && (now - g_lastSqzMs) < 250)
-      return;
-   g_lastSqzMs = now;
 
-//--- 全決済の残り（決済失敗分）をリトライ
+//--- 全決済の残り（決済失敗分）をリトライ（1秒間隔）
    if(g_sqzExitPending)
       SqueezeCloseAll(true);
 
-//--- BB幅の局面は確定足だけで決まるので、新しい足でだけ計算し直す
+//--- BB幅の局面は確定足だけで決まるので、新しい足でだけ計算し直す（足の切替は間引かずに検出）
    datetime t = iTime(_Symbol, g_entryTF, 0);
    if(t == 0)
       return;
@@ -724,6 +752,13 @@ void CheckSqueeze()
    bool live = (InpSqzPriceMode == SQZ_PRICE_LIVE);
    if(!live && !newBar)
       return;
+   if(live)
+     {
+      ulong now = NowMs();
+      if(g_lastSqzMs != 0 && (now - g_lastSqzMs) < 250)
+         return;
+      g_lastSqzMs = now;
+     }
    if(InpEntryMode == ENTRY_SQUEEZE)
       SqueezeEntry(live);
    if(InpSqzExit)
@@ -925,8 +960,8 @@ void SqueezeExit(const bool live)
 //+------------------------------------------------------------------+
 void SqueezeCloseAll(const bool retry)
   {
-   static uint lastMs = 0;
-   uint now = GetTickCount();
+   static ulong lastMs = 0;
+   ulong now = NowMs();
    if(retry && lastMs != 0 && (now - lastMs) < 1000)
       return;
    lastMs = now;
@@ -1291,7 +1326,7 @@ void ManualCloseOwn(const int side)
 //+------------------------------------------------------------------+
 void ManageOwn()
   {
-   uint now = GetTickCount();
+   ulong now = NowMs();
    if(g_lastManageMs != 0 && (now - g_lastManageMs) < 300)
       return;
    g_lastManageMs = now;
@@ -1535,7 +1570,7 @@ void StartClosing(const int side, const SideStat &st)
 //+------------------------------------------------------------------+
 void ProcessClosing(const int side)
   {
-   uint now = GetTickCount();
+   ulong now = NowMs();
    if(g_lastTryMs[side] != 0 && (now - g_lastTryMs[side]) < 1000)
       return;
    g_lastTryMs[side] = now;
@@ -1600,7 +1635,7 @@ void EnforceLock(const int side, const SideStat &st)
    if(st.count == 0 && st.orders == 0)
       return;
 
-   uint now = GetTickCount();
+   ulong now = NowMs();
    if(g_lastLockMs[side] != 0 && (now - g_lastLockMs[side]) < 1000)
       return;
    g_lastLockMs[side] = now;
@@ -1985,6 +2020,8 @@ int CountActiveGrids(const int side)
 //+------------------------------------------------------------------+
 int DeleteStaleOrders(const int side)
   {
+   if(OrdersTotal() == 0)
+      return(0);
    int ids[];
    ActiveGridIds(side, ids);
    for(int k = 0; k < ArraySize(ids); k++)
@@ -2332,8 +2369,8 @@ string SideKey(const int side)
 //+------------------------------------------------------------------+
 void SaveState()
   {
-   if(g_gvBase == "")
-      return;
+   if(g_gvBase == "" || g_tester)
+      return;   // テスターでは保存しない（次のテストに状態を持ち越さない・軽量化）
    GlobalVariableSet(g_gvBase + "_init", g_initAmount);
    GlobalVariableSet(g_gvBase + "_autoInit", (double)InpAutoMode);
    GlobalVariableSet(g_gvBase + "_auto", (double)g_autoMode);
@@ -2826,7 +2863,7 @@ void CreatePanel()
      }
 
    MakeRect(OBJ_PREFIX + "bg", 0, 0, Px(W), Px(466), C'24,26,34', C'90,95,120');
-   MakeLabel(OBJ_PREFIX + "title", Px(6), Px(4), "裁量Nanpin v4.20", clrWhite, fs);
+   MakeLabel(OBJ_PREFIX + "title", Px(6), Px(4), "裁量Nanpin v4.21", clrWhite, fs);
    MakeButton(OBJ_PREFIX + "collapse", Px(W - 26), Px(2), Px(22), Px(20), "－", clrDimGray, clrWhite);
    SetTip(OBJ_PREFIX + "collapse", "パネルを折りたたむ（チャートを広く見る）");
    MakeLabel(OBJ_PREFIX + "status", Px(6), Px(24), "", clrLime, fs - 2);
@@ -2896,8 +2933,16 @@ void CreatePanel()
 //+------------------------------------------------------------------+
 //| パネル更新                                                       |
 //+------------------------------------------------------------------+
-void RefreshPanel()
+void RefreshPanel(const bool force)
   {
+   if(g_noPanel)
+      return;
+//--- 表示更新は0.2秒（実時間）に1回まで。操作直後は即時
+   ulong now = GetTickCount64();
+   if(!force && g_lastPanelMs != 0 && (now - g_lastPanelMs) < 200)
+      return;
+   g_lastPanelMs = now;
+
    if(ObjectFind(0, OBJ_PREFIX + "bg") < 0)
       CreatePanel();
 
