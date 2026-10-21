@@ -106,14 +106,14 @@ input bool             InpSqzExit           = true;               // BB幅が縮
 
 input group "■ エントリー足・ボリンジャーバンド"
 input ENUM_TIMEFRAMES  InpEntryTF           = PERIOD_CURRENT;     // エントリー足（PERIOD_CURRENT＝チャートの時間足）
-input int              InpBBPeriod          = 20;                 // BB期間
+input int              InpBBPeriod          = 20;                 // BBの移動平均（ミドル）の期間 ※±σ・BB幅もこの期間で計算
 input double           InpBBDev             = 2.0;                // BB偏差（σ）※順張りの到達確認・逆張りの判定に使用
 input double           InpMaxSpread         = 0.50;               // 自動エントリー時の最大スプレッド（価格差・0＝無制限）
 
 input group "■ 上位足フィルター（マルチタイムフレーム）"
 input bool             InpUseHTF            = true;               // 上位足フィルターを使う
 input ENUM_TIMEFRAMES  InpHTF               = PERIOD_H4;          // 上位足
-input int              InpHTFBBPeriod       = 20;                 // 上位足BB期間（ミドルラインで方向判定）
+input int              InpHTFBBPeriod       = 20;                 // 上位足BBの移動平均（ミドル）の期間（ミドルラインで方向判定）
 input double           InpHTFBBDev          = 2.0;                // 上位足BB偏差（σ）
 input int              InpHTFSlopeBars      = 3;                  // ミドルの傾き判定本数（0＝傾きを見ない）
 input ENUM_HTF_NEUTRAL InpHTFNeutral        = HTF_NEUTRAL_BOTH;   // 上位足の方向が定まらない時
