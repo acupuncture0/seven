@@ -1,11 +1,12 @@
 //+------------------------------------------------------------------+
 //|                                                 裁量Nanpin.mq5   |
-//|   裁量Nanpin  v4.21                                               |
+//|   裁量Nanpin  v4.22                                               |
 //|   ・レート予約：SELL／BUY 各3つの入力ボックス。到達で成行＋指値     |
 //|                                                                  |
 //|   【エントリー】                                                  |
 //|   ・BB幅ブレイク（初期値）：BB幅が縮小→拡大に転じた後、            |
 //|     ＋1σを超えたら買い／−1σを割ったら売り（拡大局面ごとに1回）     |
+//|     上位足フィルターON時は上位足の方向へのブレイクだけを採用        |
 //|   ・BB幅の縮小転換：拡大→縮小に転じ、価格が±2σ以内なら             |
 //|     自EAのポジションを全決済＋未約定の指値を削除                    |
 //|   ・順張り（初期値）：上位足の方向に、下位足の±2σ到達→±1.3σ戻りで |
@@ -28,7 +29,7 @@
 //|   ・銘柄のサフィックス有無（XAUUSD／XAUUSDx／XAUUSD-m 等）を同一視  |
 //+------------------------------------------------------------------+
 #property copyright "KOHI"
-#property version   "4.21"
+#property version   "4.22"
 //--- 説明文（#property description）は MetaEditor のプロジェクト（.mqproj）側の設定と
 //--- 重複して警告が出るため記載していません。使い方は設定ガイドを参照してください。
 
@@ -101,7 +102,6 @@ input group "■ BB幅ブレイク（BB幅の拡大転換でエントリー・�
 input double           InpSqzEntryDev       = 1.0;                // エントリーのσ（拡大転換後、＋このσ超えで買い／−このσ割れで売り）
 input ENUM_SQZ_PRICE   InpSqzPriceMode      = SQZ_PRICE_CLOSE;    // σ超え・±2σ以内の判定に使う価格
 input int              InpSqzConfirmBars    = 1;                  // BB幅の転換とみなす連続本数（1＝1本の増減で転換）
-input bool             InpSqzUseHTF         = false;              // 上位足フィルターも使う（OFF＝BB幅とσだけで判断）
 input bool             InpSqzExit           = true;               // BB幅が縮小に転じ±2σ以内なら全決済（どの方式でも有効）
 
 input group "■ エントリー足・ボリンジャーバンド"
@@ -111,7 +111,7 @@ input double           InpBBDev             = 2.0;                // BB偏差（
 input double           InpMaxSpread         = 0.50;               // 自動エントリー時の最大スプレッド（価格差・0＝無制限）
 
 input group "■ 上位足フィルター（マルチタイムフレーム）"
-input bool             InpUseHTF            = true;               // 上位足フィルターを使う
+input bool             InpUseHTF            = true;               // 上位足フィルターを使う（全方式共通：上位足の方向にだけエントリー）
 input ENUM_TIMEFRAMES  InpHTF               = PERIOD_H4;          // 上位足
 input int              InpHTFBBPeriod       = 20;                 // 上位足BBの移動平均（ミドル）の期間（ミドルラインで方向判定）
 input double           InpHTFBBDev          = 2.0;                // 上位足BB偏差（σ）
@@ -240,6 +240,7 @@ int               g_sqzConfirmShift = -1;              // 転換が確定した�
 datetime          g_sqzEntryUsed   = 0;                // エントリー済みの拡大局面（転換足の時刻）
 datetime          g_sqzExitUsed    = 0;                // 決済済みの縮小局面（転換足の時刻）
 bool              g_sqzExitPending = false;            // 全決済の残りをリトライ中
+datetime          g_sqzSkipLog[2];                     // 上位足と逆向きのブレイクをログに出した局面
 ulong             g_lastSqzMs      = 0;
 int               g_hATRH          = INVALID_HANDLE;
 double            g_pip            = 0.1;
@@ -302,7 +303,7 @@ int OnInit()
    g_entryTF = (InpEntryTF == PERIOD_CURRENT) ? (ENUM_TIMEFRAMES)_Period : InpEntryTF;
    bool needE  = (InpEntryMode == ENTRY_TREND);
    bool needS  = (InpEntryMode == ENTRY_SQUEEZE);
-   bool needH  = UseHTFFilter();
+   bool needH  = InpUseHTF;
    bool needAH = !g_noPanel;   // 上位足ATRはパネル表示のみで使用
    g_hBB   = iBands(_Symbol, g_entryTF, InpBBPeriod, 0, InpBBDev, PRICE_CLOSE);
    g_hATR  = iATR(_Symbol, g_entryTF, InpATRPeriod);
@@ -377,6 +378,8 @@ int OnInit()
    g_sqzEntryUsed    = 0;
    g_sqzExitUsed     = 0;
    g_sqzExitPending  = false;
+   g_sqzSkipLog[SIDE_SELL] = 0;
+   g_sqzSkipLog[SIDE_BUY]  = 0;
 
    g_gvBase = "7HA_" + IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)) + "_" +
               g_targetCore + "_" + IntegerToString(InpMagic);
@@ -386,9 +389,9 @@ int OnInit()
 //--- 起動直後の足ではエントリーしない
    g_lastBarTime = iTime(_Symbol, g_entryTF, 0);
 
-   PrintFormat("%s起動 v4.21：口座通貨=%s／自動化=%s／方式=%s／BB幅縮小で全決済=%s／エントリー足=%s／上位足=%s／SELL損切り=%s／BUY損切り=%s／監視Magic=%s／銘柄=%s",
+   PrintFormat("%s起動 v4.22：口座通貨=%s／自動化=%s／方式=%s／BB幅縮小で全決済=%s／エントリー足=%s／上位足=%s／SELL損切り=%s／BUY損切り=%s／監視Magic=%s／銘柄=%s",
                LOG_TAG, g_currency, AutoModeText(g_autoMode), EntryModeText(), (InpSqzExit ? "ON" : "OFF"), TFName(g_entryTF),
-               (UseHTFFilter() ? TFName(InpHTF) : "OFF"),
+               (InpUseHTF ? TFName(InpHTF) : "OFF"),
                FormatMoney(g_slAmt[SIDE_SELL]), FormatMoney(g_slAmt[SIDE_BUY]),
                MagicListText(), ScopeText());
    for(int s = 0; s < 2; s++)
@@ -852,6 +855,22 @@ void SqueezeEntry(const bool live)
    if(side < 0)
       return;
 
+//--- 上位足と逆向き（または許可されていない方向）のブレイクは無視する
+//--- 局面は使用済みにしないので、同じ拡大局面で上位足の方向に抜ければエントリーできる
+   if(!TrendSideAllowed(side))
+     {
+      if(g_sqzSkipLog[side] != g_sqzTurn)
+        {
+         g_sqzSkipLog[side] = g_sqzTurn;
+         g_lastSignal = TimeToString(TimeCurrent(), TIME_DATE | TIME_MINUTES) + " " + SideName(side) + "（見送り：上位足と逆向き）";
+         Print(LOG_TAG + StringFormat("BB幅ブレイク%s（%s）：%s%.1fσを%s → 見送り：%s。この拡大局面は引き続き%s",
+                                      SideName(side), TFName(g_entryTF), (side == SIDE_BUY ? "＋" : "−"), InpSqzEntryDev,
+                                      (side == SIDE_BUY ? "上抜け" : "下抜け"), SqueezeBlockText(side),
+                                      (TrendSideAllowed(1 - side) ? SideName(1 - side) + "方向のブレイクを待ちます" : "上位足の方向待ちです")));
+        }
+      return;
+     }
+
 //--- この拡大局面の判断はこれで確定（売り・買いのどちらか1回だけ）
    g_sqzEntryUsed = g_sqzTurn;
    SaveState();
@@ -863,7 +882,7 @@ void SqueezeEntry(const bool live)
                              PriceText(side == SIDE_BUY ? up : lo), (side == SIDE_BUY ? "上抜け" : "下抜け"));
 
 //--- 起動前にすでにブレイクしていた局面は、途中から飛び乗らない
-   if(SqueezeBrokeBefore(live))
+   if(SqueezeBrokeBefore(side, live))
      {
       g_lastSignal = TimeToString(TimeCurrent(), TIME_DATE | TIME_MINUTES) + " " + SideName(side) + "（見送り：ブレイク済の局面）";
       Print(LOG_TAG + msg + "　→ 見送り：この拡大局面ではすでに±" + DoubleToString(InpSqzEntryDev, 1) + "σを超えていました");
@@ -892,9 +911,13 @@ void SqueezeEntry(const bool live)
 //+------------------------------------------------------------------+
 //| 転換確定後、今回より前の確定足ですでに±1σを超えていたか            |
 //|   （EAを止めていた間のブレイクに、後から飛び乗らないための確認）     |
+//|   上位足フィルターON：上位足と逆向きのブレイクは無視されるので、      |
+//|   エントリーする方向のブレイクだけを確認する                         |
 //+------------------------------------------------------------------+
-bool SqueezeBrokeBefore(const bool live)
+bool SqueezeBrokeBefore(const int side, const bool live)
   {
+   bool chkBuy  = !InpUseHTF || side == SIDE_BUY;
+   bool chkSell = !InpUseHTF || side == SIDE_SELL;
 //--- 確定足判定：転換が確定した足の確定時から判定の機会がある
 //--- 現在値判定：転換が確定した足の次の足から判定の機会がある
    int from = live ? g_sqzConfirmShift - 1 : g_sqzConfirmShift;
@@ -912,9 +935,26 @@ bool SqueezeBrokeBefore(const bool live)
       CopyClose(_Symbol, g_entryTF, to, cnt, cl) != cnt)
       return(false);
    for(int i = 0; i < cnt; i++)
-      if(cl[i] > up[i] || cl[i] < lo[i])
+      if((chkBuy && cl[i] > up[i]) || (chkSell && cl[i] < lo[i]))
          return(true);
    return(false);
+  }
+
+//+------------------------------------------------------------------+
+//| ブレイク方向が許可されない理由（ログ用）                           |
+//+------------------------------------------------------------------+
+string SqueezeBlockText(const int side)
+  {
+   if(side == SIDE_SELL && !InpAllowSell)
+      return("売りは許可されていません");
+   if(side == SIDE_BUY && !InpAllowBuy)
+      return("買いは許可されていません");
+   int tr = HTFTrend();
+   if(tr == 1)
+      return("上位足" + TFName(InpHTF) + "が上昇中（売り不可）");
+   if(tr == -1)
+      return("上位足" + TFName(InpHTF) + "が下降中（買い不可）");
+   return("上位足" + TFName(InpHTF) + "の方向が不明確");
   }
 
 //+------------------------------------------------------------------+
@@ -1008,8 +1048,14 @@ string TrendStatusText(color &clr)
       string since = (g_sqzTurn > 0) ? "（" + TimeToString(g_sqzTurn, TIME_DATE | TIME_MINUTES) + "〜）" : "";
       if(g_sqzPhase == 1 && g_sqzTurn > g_sqzEntryUsed)
         {
-         clr = clrGold;
-         return(StringFormat("方式：BB幅 拡大中%s → ＋%.1fσ超で買い／−%.1fσ割れで売り", since, InpSqzEntryDev, InpSqzEntryDev));
+         bool   okB = TrendSideAllowed(SIDE_BUY);
+         bool   okS = TrendSideAllowed(SIDE_SELL);
+         string tB  = StringFormat("＋%.1fσ超で買い", InpSqzEntryDev);
+         string tS  = StringFormat("−%.1fσ割れで売り", InpSqzEntryDev);
+         if(!okB && !okS)
+            return("方式：BB幅 拡大中" + since + " → 上位足の方向待ち（エントリー対象なし）");
+         clr = (okB && okS) ? clrGold : (okB ? clrDeepSkyBlue : clrTomato);
+         return("方式：BB幅 拡大中" + since + " → " + ((okB && okS) ? tB + "／" + tS : (okB ? tB + "のみ" : tS + "のみ")));
         }
       if(g_sqzPhase == 1)
          return("方式：BB幅 拡大中" + since + " → この局面は判断済み（縮小転換待ち）");
@@ -1153,7 +1199,7 @@ bool EntryAllowed(const int side, const bool manual, string &reason)
       return(false);
      }
 
-   if(UseHTFFilter())
+   if(InpUseHTF)
      {
       int tr = HTFTrend();
       if(tr == 1 && side == SIDE_SELL)
@@ -2634,14 +2680,6 @@ string EntryModeText()
   }
 
 //+------------------------------------------------------------------+
-//| 自動エントリーに上位足フィルターを使うか（BB幅ブレイクは専用設定）  |
-//+------------------------------------------------------------------+
-bool UseHTFFilter()
-  {
-   return(InpEntryMode == ENTRY_SQUEEZE ? InpSqzUseHTF : InpUseHTF);
-  }
-
-//+------------------------------------------------------------------+
 string ScopeText()
   {
    return(_Symbol);
@@ -2863,7 +2901,7 @@ void CreatePanel()
      }
 
    MakeRect(OBJ_PREFIX + "bg", 0, 0, Px(W), Px(466), C'24,26,34', C'90,95,120');
-   MakeLabel(OBJ_PREFIX + "title", Px(6), Px(4), "裁量Nanpin v4.21", clrWhite, fs);
+   MakeLabel(OBJ_PREFIX + "title", Px(6), Px(4), "裁量Nanpin v4.22", clrWhite, fs);
    MakeButton(OBJ_PREFIX + "collapse", Px(W - 26), Px(2), Px(22), Px(20), "－", clrDimGray, clrWhite);
    SetTip(OBJ_PREFIX + "collapse", "パネルを折りたたむ（チャートを広く見る）");
    MakeLabel(OBJ_PREFIX + "status", Px(6), Px(24), "", clrLime, fs - 2);
@@ -3006,7 +3044,7 @@ void RefreshPanel(const bool force)
 //--- 上位足
    string htfText;
    color  htfCol = clrWhite;
-   if(!UseHTFFilter())
+   if(!InpUseHTF)
       htfText = "上位足：OFF（両方向）";
    else
      {
