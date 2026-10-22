@@ -1,6 +1,6 @@
 //+------------------------------------------------------------------+
 //|                                                 裁量Nanpin.mq5   |
-//|   裁量Nanpin  v4.60                                               |
+//|   裁量Nanpin  v4.70                                               |
 //|   ・レート予約：SELL／BUY 各3つの入力ボックス。到達で成行＋指値     |
 //|                                                                  |
 //|   【エントリー】                                                  |
@@ -9,6 +9,7 @@
 //|   ・逆張り（選択可）：確定足がバンドの外でエントリー                |
 //|   ・再ブレイク（選択可）：直近N本の高値（安値）をブレイク→走る→     |
 //|     内側へ戻る→高値（安値）を現在値で再ブレイクしたらエントリー      |
+//|     決済：終値で損切りライン割れ／第1目標で建値＋トレール／時間切れ |
 //|   ・自動化：しない／自動エントリー（パネルで切替）・通知機能なし    |
 //|   ・上位足フィルター：上位足の方向に逆らわない（押し目買い・戻り売り）|
 //|   ・ATR：チャートに表示／上限・下限で新規停止／間隔・利確幅を可変   |
@@ -28,7 +29,7 @@
 //|   ・銘柄のサフィックス有無（XAUUSD／XAUUSDx／XAUUSD-m 等）を同一視  |
 //+------------------------------------------------------------------+
 #property copyright "KOHI"
-#property version   "4.60"
+#property version   "4.70"
 //--- 説明文（#property description）は MetaEditor のプロジェクト（.mqproj）側の設定と
 //--- 重複して警告が出るため記載していません。使い方は設定ガイドを参照してください。
 
@@ -48,6 +49,13 @@ enum ENUM_ENTRY_MODE
    ENTRY_TREND    = 0,      // 順張り（上位足の方向＋下位足の±2σ到達→±1.3σへの戻り）
    ENTRY_REVERSAL = 1,      // 逆張り（確定足がバンドの外）
    ENTRY_REBREAK  = 2       // 再ブレイク（直近高値・安値をブレイク→走る→戻る→再ブレイク）
+  };
+
+enum ENUM_RB_TRAIL
+  {
+   RB_TRAIL_OFF  = 0,       // トレールしない
+   RB_TRAIL_ATR  = 1,       // 最も有利な価格からATR×倍率
+   RB_TRAIL_BARS = 2        // 直近N本の安値（SELLは高値）
   };
 
 enum ENUM_SIGNAL_MODE
@@ -97,6 +105,14 @@ input double           InpRbRunATR          = 1.0;                // 「走っ�
 input double           InpRbPullATR         = 0.2;                // 「戻った」とみなす幅：基準ラインの内側へATR×この倍率以上
 input double           InpRbFailATR         = 1.5;                // 無効：基準ラインの内側へATR×この倍率以上戻ったら（戻りが深すぎ）
 input int              InpRbMaxBars         = 30;                 // 無効：ブレイクからこの本数以内に再ブレイクしなければ（0＝無制限）
+
+input group "■ 再ブレイクの決済（再ブレイクで建てたグリッドごと）"
+input double           InpRbStopATR         = 1.5;                // 1)損切り：確定足の終値が基準ラインの内側へATR×この倍率を超えたら全決済（0＝OFF）
+input bool             InpRbBEAtExt         = true;               // 2)第1目標（ブレイク後の高値・安値）到達で建値ストップ＋残りの指値を削除
+input ENUM_RB_TRAIL    InpRbTrailMode       = RB_TRAIL_ATR;       // 3)第1目標到達後のトレール
+input double           InpRbTrailATR        = 1.0;                // 3)トレール幅：最も有利な価格からATR×この倍率
+input int              InpRbTrailBars       = 5;                  // 3)トレール：直近この本数の安値（SELLは高値）
+input int              InpRbTimeBars        = 20;                 // 4)時間切れ：エントリーからこの本数以内に第1目標へ届かなければ全決済（0＝OFF）
 
 input group "■ エントリー足・ボリンジャーバンド"
 input ENUM_TIMEFRAMES  InpEntryTF           = PERIOD_CURRENT;     // エントリー足（PERIOD_CURRENT＝チャートの時間足）
@@ -243,6 +259,23 @@ RebreakState      g_rb[2];
 double            g_rbLevel[2];                        // 待機中の基準ライン（新しい足で更新）
 double            g_rbUsed[2];                         // エントリー済みの基準ライン
 datetime          g_rbBarTime      = 0;
+struct RbTrade                                         // 再ブレイクで建てたグリッドの決済管理
+  {
+   int               gid;        // グリッド番号
+   int               side;
+   double            level;      // 基準ライン
+   double            ext;        // 第1目標（ブレイク後の高値・安値）
+   double            atr;        // エントリー時のATR
+   double            peak;       // エントリー後の最も有利な価格（トレール用）
+   datetime          entryTime;  // エントリーした足
+   bool              beDone;     // 第1目標に到達済み
+   bool              closing;    // 全決済の送信済み
+   ulong             sendMs;
+  };
+RbTrade           g_rbt[];
+datetime          g_rbtBarTime     = 0;
+ulong             g_lastRbtMs      = 0;
+bool              g_rbtWarned      = false;
 int               g_hATRH          = INVALID_HANDLE;
 double            g_pip            = 0.1;
 string            g_bbName         = "";
@@ -287,7 +320,8 @@ int OnInit()
 
    if(InpLot <= 0 || InpGridCount < 0 || InpGridStep <= 0 || InpMicroTP <= 0 || InpBBPeriod < 2 || InpATRPeriod < 1 || InpMaxGridsPerSide < 1 ||
       InpTrendEntryDev <= 0 || InpTrendEntryDev >= InpBBDev || InpTrendLookback < 0 ||
-      InpRbLookback < 1 || InpRbRunATR <= 0 || InpRbPullATR < 0 || InpRbFailATR <= InpRbPullATR || InpRbMaxBars < 0)
+      InpRbLookback < 1 || InpRbRunATR <= 0 || InpRbPullATR < 0 || InpRbFailATR <= InpRbPullATR || InpRbMaxBars < 0 ||
+      InpRbStopATR < 0 || InpRbTrailATR <= 0 || InpRbTrailBars < 1 || InpRbTimeBars < 0)
      {
       Print(LOG_TAG + "ロット・本数・間隔・利確幅・期間の設定を確認してください。");
       return(INIT_PARAMETERS_INCORRECT);
@@ -296,6 +330,7 @@ int OnInit()
 //--- 銘柄の基本名（サフィックス有無を同一視：状態保存のキーに使用）
    ArrayResize(g_scName, 0);
    ArrayResize(g_scCore, 0);
+   ArrayResize(g_rbt, 0);
    g_targetCore = SymbolCore(_Symbol);
    if(StringLen(g_targetCore) < 3)
       g_targetCore = _Symbol;
@@ -404,7 +439,7 @@ int OnInit()
 //--- 起動直後の足ではエントリーしない
    g_lastBarTime = iTime(_Symbol, g_entryTF, 0);
 
-   PrintFormat("%s起動 v4.60：口座通貨=%s／自動化=%s／方式=%s／エントリー足=%s／上位足=%s／SELL損切り=%s／BUY損切り=%s／監視Magic=%s／銘柄=%s",
+   PrintFormat("%s起動 v4.70：口座通貨=%s／自動化=%s／方式=%s／エントリー足=%s／上位足=%s／SELL損切り=%s／BUY損切り=%s／監視Magic=%s／銘柄=%s",
                LOG_TAG, g_currency, AutoModeText(g_autoMode), EntryModeText(), TFName(g_entryTF),
                (InpUseHTF ? TFName(InpHTF) : "OFF"),
                FormatMoney(g_slAmt[SIDE_SELL]), FormatMoney(g_slAmt[SIDE_BUY]),
@@ -468,6 +503,7 @@ void MainLoop()
    CheckRebreak();   // 2'') 再ブレイク：ブレイク→走る→戻る→再ブレイクを監視
    CheckReservations(); // 2'') レート予約の到達チェック
    ManageOwn();      // 3) 自EAポジションの微益利確・最有利ポジ管理
+   ManageRebreakTrades(); // 3') 再ブレイクのグリッドの損切り・建値・トレール・時間切れ
    RefreshPanel(false);
   }
 
@@ -867,7 +903,8 @@ void RebreakSide(const int side, const double bid)
       if(ok)
         {
          Print(LOG_TAG + msg);
-         PlaceGrid(side, false);
+         if(PlaceGrid(side, false))
+            RbTradeAdd(g_gridSeq, side, lvl, g_rb[side].ext, atr, bid);
         }
       else
          Print(LOG_TAG + msg + "　→ 見送り：" + reason);
@@ -882,6 +919,343 @@ void RebreakReset(const int side, const string why)
    if(g_rb[side].stage >= 2)
       Print(LOG_TAG + "再ブレイク" + SideName(side) + "：パターン無効 → " + why);
    g_rb[side].stage = 0;
+  }
+
+//+------------------------------------------------------------------+
+//|                                                                  |
+//|   ■ 再ブレイクの決済（再ブレイクで建てたグリッドごとに管理）        |
+//|     1) 損切り　：確定足の終値が 基準ライン∓ATR×倍率 を超えたら全決済 |
+//|     2) 第1目標 ：ブレイク後の高値（安値）到達で建値ストップ          |
+//|                  ＋残りの指値を削除                                |
+//|     3) トレール：第1目標到達後、ATR幅 または 直近N本の安値（高値）   |
+//|     4) 時間切れ：一定本数以内に第1目標へ届かなければ全決済           |
+//|                                                                  |
+//+------------------------------------------------------------------+
+void RbTradeAdd(const int gid, const int side, const double level, const double ext, const double atr, const double px)
+  {
+   int n = ArraySize(g_rbt);
+   ArrayResize(g_rbt, n + 1);
+   g_rbt[n].gid       = gid;
+   g_rbt[n].side      = side;
+   g_rbt[n].level     = level;
+   g_rbt[n].ext       = ext;
+   g_rbt[n].atr       = atr;
+   g_rbt[n].peak      = px;
+   g_rbt[n].entryTime = iTime(_Symbol, g_entryTF, 0);
+   g_rbt[n].beDone    = false;
+   g_rbt[n].closing   = false;
+   g_rbt[n].sendMs    = 0;
+   SaveState();
+   PrintFormat("%s再ブレイク%s #%d の決済管理：第1目標 %s／損切りライン %s（終値）／時間切れ %s", LOG_TAG, SideName(side), gid,
+               PriceText(ext), (InpRbStopATR > 0 ? PriceText(RbStopLine(n)) : "OFF"),
+               (InpRbTimeBars > 0 ? IntegerToString(InpRbTimeBars) + "本" : "OFF"));
+  }
+
+//+------------------------------------------------------------------+
+void RbTradeRemove(const int i)
+  {
+   int n = ArraySize(g_rbt);
+   for(int k = i; k < n - 1; k++)
+      g_rbt[k] = g_rbt[k + 1];
+   ArrayResize(g_rbt, n - 1);
+   SaveState();
+  }
+
+//+------------------------------------------------------------------+
+double RbStopLine(const int i)
+  {
+   double d = g_rbt[i].atr * InpRbStopATR;
+   return(NormPrice(g_rbt[i].side == SIDE_BUY ? g_rbt[i].level - d : g_rbt[i].level + d));
+  }
+
+//+------------------------------------------------------------------+
+//| グリッド番号の自EAポジション・指値の数                             |
+//+------------------------------------------------------------------+
+int GridPositions(const int gid)
+  {
+   int cnt   = 0;
+   int total = PositionsTotal();
+   for(int i = total - 1; i >= 0; i--)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0 || !IsOwnPositionSelected())
+         continue;
+      int    g = 0;
+      double w = 0.0;
+      if(ParseGridComment(PositionGetString(POSITION_COMMENT), g, w) && g == gid)
+         cnt++;
+     }
+   return(cnt);
+  }
+
+//+------------------------------------------------------------------+
+int GridPositionsUnknown(const int side)
+  {
+   int cnt   = 0;
+   int total = PositionsTotal();
+   for(int i = total - 1; i >= 0; i--)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0 || !IsOwnPositionSelected() || PositionSideSelected() != side)
+         continue;
+      int    g = 0;
+      double w = 0.0;
+      if(!ParseGridComment(PositionGetString(POSITION_COMMENT), g, w))
+         cnt++;
+     }
+   return(cnt);
+  }
+
+//+------------------------------------------------------------------+
+int GridOrders(const int gid)
+  {
+   int cnt   = 0;
+   int total = OrdersTotal();
+   for(int i = total - 1; i >= 0; i--)
+     {
+      ulong ticket = OrderGetTicket(i);
+      if(ticket == 0 || !IsOwnOrderSelected())
+         continue;
+      int    g = 0;
+      double w = 0.0;
+      if(ParseGridComment(OrderGetString(ORDER_COMMENT), g, w) && g == gid)
+         cnt++;
+     }
+   return(cnt);
+  }
+
+//+------------------------------------------------------------------+
+//| グリッド番号の指値を削除（非同期）                                 |
+//+------------------------------------------------------------------+
+int DeleteGridOrders(const int gid)
+  {
+   int deleted = 0;
+   int total   = OrdersTotal();
+   for(int i = total - 1; i >= 0; i--)
+     {
+      ulong ticket = OrderGetTicket(i);
+      if(ticket == 0 || !IsOwnOrderSelected())
+         continue;
+      int    g = 0;
+      double w = 0.0;
+      if(ParseGridComment(OrderGetString(ORDER_COMMENT), g, w) && g == gid && DeleteOrderTicket(ticket, true))
+         deleted++;
+     }
+   return(deleted);
+  }
+
+//+------------------------------------------------------------------+
+//| グリッドの全決済：指値削除＋ポジション決済を一斉送信（非同期）       |
+//+------------------------------------------------------------------+
+void SendGridClose(const int i)
+  {
+   int gid = g_rbt[i].gid;
+   DeleteGridOrders(gid);
+   int total = PositionsTotal();
+   for(int k = total - 1; k >= 0; k--)
+     {
+      ulong ticket = PositionGetTicket(k);
+      if(ticket == 0 || !IsOwnPositionSelected())
+         continue;
+      int    g = 0;
+      double w = 0.0;
+      if(ParseGridComment(PositionGetString(POSITION_COMMENT), g, w) && g == gid)
+         ClosePositionTicket(ticket, true);
+     }
+   g_rbt[i].sendMs = NowMs();
+  }
+
+//+------------------------------------------------------------------+
+void StartGridClose(const int i, const string why)
+  {
+   g_rbt[i].closing = true;
+   g_failPrintCount = 0;
+   SetAction(StringFormat("【%s】再ブレイク #%d を全決済：%s", SideName(g_rbt[i].side), g_rbt[i].gid, why));
+   SendGridClose(i);
+  }
+
+//+------------------------------------------------------------------+
+//| 毎ティック（0.3秒間隔）：再ブレイクのグリッドの決済管理             |
+//+------------------------------------------------------------------+
+void ManageRebreakTrades()
+  {
+//--- 足の切替は間引かずに検出（損切り・時間切れは確定足で判定）
+//--- 管理中のグリッドがない間も追跡し、エントリー直後に古い足の確定と取り違えないようにする
+   bool     newBar = false;
+   datetime t0     = iTime(_Symbol, g_entryTF, 0);
+   if(t0 != 0 && t0 != g_rbtBarTime)
+     {
+      newBar       = (g_rbtBarTime != 0);
+      g_rbtBarTime = t0;
+     }
+   if(ArraySize(g_rbt) == 0)
+      return;
+   ulong now = NowMs();
+   if(!newBar && g_lastRbtMs != 0 && (now - g_lastRbtMs) < 300)
+      return;
+   g_lastRbtMs = now;
+
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   if(bid <= 0 || ask <= 0)
+      return;
+
+   for(int i = ArraySize(g_rbt) - 1; i >= 0; i--)
+     {
+      int  side = g_rbt[i].side;
+      bool buy  = (side == SIDE_BUY);
+      if(g_closing[side] || (g_flatActive && FlatSide(side)))
+         continue;   // 損切り監視・一括決済の処理に任せる
+
+      int gid = g_rbt[i].gid;
+      int pos = GridPositions(gid);
+
+//--- ポジションがなくなった：このグリッドは終了（残った指値も片付ける）
+//--- ※グリッド番号を読めないポジション（ブローカーがコメントを書き換えた等）がある時は、誤判定を避けて何もしない
+      if(pos == 0 && GridPositionsUnknown(side) > 0)
+        {
+         if(!g_rbtWarned)
+           {
+            Print(LOG_TAG + "ポジションのコメントからグリッド番号を読めないため、再ブレイクの決済管理を停止しています");
+            g_rbtWarned = true;
+           }
+         continue;
+        }
+      if(pos == 0)
+        {
+         if(GridOrders(gid) > 0)
+           {
+            if(now - g_rbt[i].sendMs >= 1000)
+              {
+               DeleteGridOrders(gid);
+               g_rbt[i].sendMs = now;
+              }
+            continue;
+           }
+         if(g_rbt[i].closing)
+            SetAction(StringFormat("【%s】再ブレイク #%d の全決済が完了しました", SideName(side), gid));
+         RbTradeRemove(i);
+         continue;
+        }
+
+//--- 全決済の送信済み：1秒ごとに残りを再送
+      if(g_rbt[i].closing)
+        {
+         if(now - g_rbt[i].sendMs >= 1000)
+            SendGridClose(i);
+         continue;
+        }
+
+      double px = buy ? bid : ask;   // 決済側の価格
+      if(buy ? px > g_rbt[i].peak : px < g_rbt[i].peak)
+         g_rbt[i].peak = px;
+
+//--- 1) 損切り・4) 時間切れ（確定足）
+      if(newBar)
+        {
+         double c1 = iClose(_Symbol, g_entryTF, 1);
+         if(InpRbStopATR > 0 && c1 > 0)
+           {
+            double sl = RbStopLine(i);
+            if(buy ? c1 < sl : c1 > sl)
+              {
+               StartGridClose(i, StringFormat("損切り（終値 %s が損切りライン %s を%s）", PriceText(c1), PriceText(sl),
+                                              (buy ? "下抜け" : "上抜け")));
+               continue;
+              }
+           }
+         if(InpRbTimeBars > 0 && !g_rbt[i].beDone && iBarShift(_Symbol, g_entryTF, g_rbt[i].entryTime) >= InpRbTimeBars)
+           {
+            StartGridClose(i, StringFormat("時間切れ（%d本以内に第1目標 %s へ届かず）", InpRbTimeBars, PriceText(g_rbt[i].ext)));
+            continue;
+           }
+        }
+
+//--- 2) 第1目標：ブレイク後の高値（安値）に到達
+      if(!g_rbt[i].beDone && (buy ? px >= g_rbt[i].ext : px <= g_rbt[i].ext))
+        {
+         g_rbt[i].beDone = true;
+         int d = InpRbBEAtExt ? DeleteGridOrders(gid) : 0;
+         SaveState();
+         SetAction(StringFormat("【%s】再ブレイク #%d 第1目標 %s に到達%s", SideName(side), gid, PriceText(g_rbt[i].ext),
+                                (InpRbBEAtExt ? StringFormat("：建値ストップ・指値%d件削除", d) : "")));
+        }
+      if(g_rbt[i].beDone)
+         RbApplyStops(i, bid, ask);
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| 2) 建値ストップ・3) トレールのSLを、グリッドの各ポジションに設定     |
+//|    SLは有利な方向にだけ動かす                                      |
+//+------------------------------------------------------------------+
+void RbApplyStops(const int i, const double bid, const double ask)
+  {
+   int  side = g_rbt[i].side;
+   bool buy  = (side == SIDE_BUY);
+   int  gid  = g_rbt[i].gid;
+
+//--- トレールの位置
+   bool   useTrail = false;
+   double trail    = 0.0;
+   if(InpRbTrailMode == RB_TRAIL_ATR)
+     {
+      double d = g_rbt[i].atr * InpRbTrailATR;
+      trail    = buy ? g_rbt[i].peak - d : g_rbt[i].peak + d;
+      useTrail = true;
+     }
+   else
+      if(InpRbTrailMode == RB_TRAIL_BARS)
+        {
+         int k = buy ? iLowest(_Symbol, g_entryTF, MODE_LOW, InpRbTrailBars, 1)
+                 : iHighest(_Symbol, g_entryTF, MODE_HIGH, InpRbTrailBars, 1);
+         if(k >= 0)
+           {
+            trail    = buy ? iLow(_Symbol, g_entryTF, k) : iHigh(_Symbol, g_entryTF, k);
+            useTrail = (trail > 0);
+           }
+        }
+   if(!InpRbBEAtExt && !useTrail)
+      return;
+
+   double tick = TickSize();
+   double step = MathMax(tick, g_rbt[i].atr * 0.05);   // 細かすぎる変更は送らない
+   double minD = MinStopDistance();
+
+   int total = PositionsTotal();
+   for(int k = total - 1; k >= 0; k--)
+     {
+      ulong ticket = PositionGetTicket(k);
+      if(ticket == 0 || !IsOwnPositionSelected())
+         continue;
+      int    g = 0;
+      double w = 0.0;
+      if(!ParseGridComment(PositionGetString(POSITION_COMMENT), g, w) || g != gid)
+         continue;
+
+      double open = PositionGetDouble(POSITION_PRICE_OPEN);
+      double sl   = PositionGetDouble(POSITION_SL);
+      double tp   = PositionGetDouble(POSITION_TP);
+
+      bool   has    = false;
+      double target = 0.0;
+      if(InpRbBEAtExt)
+        {
+         target = open;
+         has    = true;
+        }
+      if(useTrail)
+        {
+         target = has ? (buy ? MathMax(target, trail) : MathMin(target, trail)) : trail;
+         has    = true;
+        }
+      target = NormPrice(target);
+
+      bool better = (sl == 0.0) || (buy ? target >= sl + step : target <= sl - step);
+      double dist = buy ? bid - target : target - ask;
+      if(better && dist >= minD && dist > 0)
+         g_trade.PositionModify(ticket, target, tp);
+     }
   }
 
 //+------------------------------------------------------------------+
@@ -915,6 +1289,17 @@ string RebreakStatusText(color &clr)
          out += "（上位足で見送り）";
       out += "　";
      }
+   for(int i = 0; i < ArraySize(g_rbt); i++)
+     {
+      out += StringFormat("\n保有%s #%d：", SideName(g_rbt[i].side), g_rbt[i].gid);
+      if(g_rbt[i].closing)
+         out += "全決済中";
+      else
+         if(g_rbt[i].beDone)
+            out += "第1目標到達済（建値・トレール中）";
+         else
+            out += "第1目標 " + PriceText(g_rbt[i].ext) + (InpRbStopATR > 0 ? "／損切りライン " + PriceText(RbStopLine(i)) : "");
+     }
    return(out);
   }
 
@@ -944,6 +1329,32 @@ void DrawRebreakLines()
       ObjectSetString(0, name, OBJPROP_TOOLTIP, StringFormat("再ブレイク%sの基準ライン %s（%s）", SideName(side),
                       PriceText(g_rb[side].level), (g_rb[side].stage == 1 ? "走り待ち" : (g_rb[side].stage == 2 ? "戻り待ち" : "再ブレイク待ち"))));
      }
+
+//--- 保有中のグリッド：第1目標（金色）と損切りライン（橙）
+   ObjectsDeleteAll(0, OBJ_PREFIX + "rbt");
+   for(int i = 0; i < ArraySize(g_rbt); i++)
+     {
+      if(g_rbt[i].closing)
+         continue;
+      string base = OBJ_PREFIX + "rbt" + IntegerToString(g_rbt[i].gid);
+      if(!g_rbt[i].beDone)
+         RbHLine(base + "t", g_rbt[i].ext, clrGold, StringFormat("再ブレイク%s #%d 第1目標 %s", SideName(g_rbt[i].side), g_rbt[i].gid, PriceText(g_rbt[i].ext)));
+      if(InpRbStopATR > 0)
+         RbHLine(base + "s", RbStopLine(i), clrDarkOrange, StringFormat("再ブレイク%s #%d 損切りライン %s（終値で判定）", SideName(g_rbt[i].side), g_rbt[i].gid, PriceText(RbStopLine(i))));
+     }
+  }
+
+//+------------------------------------------------------------------+
+void RbHLine(const string name, const double price, const color clr, const string tip)
+  {
+   ObjectCreate(0, name, OBJ_HLINE, 0, 0, price);
+   ObjectSetInteger(0, name, OBJPROP_COLOR, clr);
+   ObjectSetInteger(0, name, OBJPROP_STYLE, STYLE_DASHDOT);
+   ObjectSetInteger(0, name, OBJPROP_WIDTH, 1);
+   ObjectSetInteger(0, name, OBJPROP_BACK, true);
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, name, OBJPROP_HIDDEN, true);
+   ObjectSetString(0, name, OBJPROP_TOOLTIP, tip);
   }
 
 //+------------------------------------------------------------------+
@@ -2460,6 +2871,21 @@ void SaveState()
    GlobalVariableSet(g_gvBase + "_fold", g_collapsed ? 1.0 : 0.0);
    GlobalVariableSet(g_gvBase + "_tgtInit", MathAbs(InpTargetProfit));
    GlobalVariableSet(g_gvBase + "_tgt", g_targetAmt);
+//--- 再ブレイクの決済管理（再起動後も同じグリッドを管理し続ける）
+   int nr = ArraySize(g_rbt);
+   GlobalVariableSet(g_gvBase + "_rbtN", (double)nr);
+   for(int i = 0; i < nr; i++)
+     {
+      string k = g_gvBase + "_rbt" + IntegerToString(i);
+      GlobalVariableSet(k + "g", (double)g_rbt[i].gid);
+      GlobalVariableSet(k + "s", (double)g_rbt[i].side);
+      GlobalVariableSet(k + "l", g_rbt[i].level);
+      GlobalVariableSet(k + "e", g_rbt[i].ext);
+      GlobalVariableSet(k + "a", g_rbt[i].atr);
+      GlobalVariableSet(k + "p", g_rbt[i].peak);
+      GlobalVariableSet(k + "t", (double)g_rbt[i].entryTime);
+      GlobalVariableSet(k + "b", g_rbt[i].beDone ? 1.0 : 0.0);
+     }
    for(int s = 0; s < 2; s++)
      {
       string k = g_gvBase + "_" + SideKey(s);
@@ -2501,6 +2927,27 @@ void LoadState()
    if(GlobalVariableCheck(g_gvBase + "_tgtInit") && GlobalVariableCheck(g_gvBase + "_tgt") &&
       MathAbs(GlobalVariableGet(g_gvBase + "_tgtInit") - MathAbs(InpTargetProfit)) < 0.0000001)
       g_targetAmt = MathAbs(GlobalVariableGet(g_gvBase + "_tgt"));
+
+   ArrayResize(g_rbt, 0);
+   int nr = GlobalVariableCheck(g_gvBase + "_rbtN") ? (int)GlobalVariableGet(g_gvBase + "_rbtN") : 0;
+   for(int i = 0; i < nr && i < 100; i++)
+     {
+      string k = g_gvBase + "_rbt" + IntegerToString(i);
+      if(!GlobalVariableCheck(k + "g") || !GlobalVariableCheck(k + "b"))
+         continue;
+      int n = ArraySize(g_rbt);
+      ArrayResize(g_rbt, n + 1);
+      g_rbt[n].gid       = (int)GlobalVariableGet(k + "g");
+      g_rbt[n].side      = ((int)GlobalVariableGet(k + "s") == SIDE_BUY) ? SIDE_BUY : SIDE_SELL;
+      g_rbt[n].level     = GlobalVariableGet(k + "l");
+      g_rbt[n].ext       = GlobalVariableGet(k + "e");
+      g_rbt[n].atr       = GlobalVariableGet(k + "a");
+      g_rbt[n].peak      = GlobalVariableGet(k + "p");
+      g_rbt[n].entryTime = (datetime)(long)GlobalVariableGet(k + "t");
+      g_rbt[n].beDone    = (GlobalVariableGet(k + "b") > 0.5);
+      g_rbt[n].closing   = false;
+      g_rbt[n].sendMs    = 0;
+     }
 
    for(int s = 0; s < 2; s++)
      {
@@ -2937,7 +3384,7 @@ void CreatePanel()
      }
 
    MakeRect(OBJ_PREFIX + "bg", 0, 0, Px(W), Px(492), C'24,26,34', C'90,95,120');
-   MakeLabel(OBJ_PREFIX + "title", Px(6), Px(4), "裁量Nanpin v4.60", clrWhite, fs);
+   MakeLabel(OBJ_PREFIX + "title", Px(6), Px(4), "裁量Nanpin v4.70", clrWhite, fs);
    MakeButton(OBJ_PREFIX + "collapse", Px(W - 26), Px(2), Px(22), Px(20), "－", clrDimGray, clrWhite);
    SetTip(OBJ_PREFIX + "collapse", "パネルを折りたたむ（チャートを広く見る）");
    MakeLabel(OBJ_PREFIX + "status", Px(6), Px(24), "", clrLime, fs - 2);
