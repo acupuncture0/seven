@@ -1,12 +1,14 @@
 //+------------------------------------------------------------------+
 //|                                                 裁量Nanpin.mq5   |
-//|   裁量Nanpin  v4.50                                               |
+//|   裁量Nanpin  v4.60                                               |
 //|   ・レート予約：SELL／BUY 各3つの入力ボックス。到達で成行＋指値     |
 //|                                                                  |
 //|   【エントリー】                                                  |
 //|   ・順張り（初期値）：上位足の方向に、下位足の±2σ到達→±1.3σ戻りで |
 //|     エントリー（例：下落中は−2σ到達後、−1.3σまで戻したら売り）    |
 //|   ・逆張り（選択可）：確定足がバンドの外でエントリー                |
+//|   ・再ブレイク（選択可）：直近N本の高値（安値）をブレイク→走る→     |
+//|     内側へ戻る→高値（安値）を現在値で再ブレイクしたらエントリー      |
 //|   ・自動化：しない／自動エントリー（パネルで切替）・通知機能なし    |
 //|   ・上位足フィルター：上位足の方向に逆らわない（押し目買い・戻り売り）|
 //|   ・ATR：チャートに表示／上限・下限で新規停止／間隔・利確幅を可変   |
@@ -26,7 +28,7 @@
 //|   ・銘柄のサフィックス有無（XAUUSD／XAUUSDx／XAUUSD-m 等）を同一視  |
 //+------------------------------------------------------------------+
 #property copyright "KOHI"
-#property version   "4.50"
+#property version   "4.60"
 //--- 説明文（#property description）は MetaEditor のプロジェクト（.mqproj）側の設定と
 //--- 重複して警告が出るため記載していません。使い方は設定ガイドを参照してください。
 
@@ -44,7 +46,8 @@ enum ENUM_AUTO_MODE
 enum ENUM_ENTRY_MODE
   {
    ENTRY_TREND    = 0,      // 順張り（上位足の方向＋下位足の±2σ到達→±1.3σへの戻り）
-   ENTRY_REVERSAL = 1       // 逆張り（確定足がバンドの外）
+   ENTRY_REVERSAL = 1,      // 逆張り（確定足がバンドの外）
+   ENTRY_REBREAK  = 2       // 再ブレイク（直近高値・安値をブレイク→走る→戻る→再ブレイク）
   };
 
 enum ENUM_SIGNAL_MODE
@@ -87,6 +90,13 @@ input ENUM_ENTRY_MODE  InpEntryMode         = ENTRY_TREND;        // エント�
 input double           InpTrendEntryDev     = 1.3;                // 順張り：戻りでエントリーするσ（下落なら−2σ到達後に−1.3σで売り）
 input int              InpTrendLookback     = 10;                 // 順張り：±2σ到達を有効とする本数（エントリー足）
 input ENUM_SIGNAL_MODE InpSignalMode        = SIG_CLOSE;          // 逆張り：シグナル条件
+
+input group "■ 再ブレイク（ブレイク→走る→戻る→再ブレイクでエントリー）"
+input int              InpRbLookback        = 20;                 // 基準ライン：直近何本の高値・安値か（エントリー足・確定足）
+input double           InpRbRunATR          = 1.0;                // 「走った」とみなす幅：ブレイク後、基準ラインからATR×この倍率以上
+input double           InpRbPullATR         = 0.2;                // 「戻った」とみなす幅：基準ラインの内側へATR×この倍率以上
+input double           InpRbFailATR         = 1.5;                // 無効：基準ラインの内側へATR×この倍率以上戻ったら（戻りが深すぎ）
+input int              InpRbMaxBars         = 30;                 // 無効：ブレイクからこの本数以内に再ブレイクしなければ（0＝無制限）
 
 input group "■ エントリー足・ボリンジャーバンド"
 input ENUM_TIMEFRAMES  InpEntryTF           = PERIOD_CURRENT;     // エントリー足（PERIOD_CURRENT＝チャートの時間足）
@@ -219,6 +229,20 @@ datetime          g_armUsed[2];                        // 順張り：使用済�
 double            g_resRate[2][RES_SLOTS];             // レート予約（0＝未設定）
 int               g_resDir[2][RES_SLOTS];              // 1＝上昇して到達、-1＝下落して到達
 ulong             g_lastTrendMs    = 0;
+
+//--- 再ブレイク
+struct RebreakState
+  {
+   int               stage;      // 0＝ブレイク待ち 1＝走り待ち 2＝戻り待ち 3＝再ブレイク待ち
+   double            level;      // ブレイクした基準ライン（直近N本の高値・安値）
+   double            ext;        // ブレイク後の最も外側の価格（BUYは最高値・SELLは最安値）
+   double            atr;        // ブレイク時のATR（確定足）
+   datetime          breakTime;  // ブレイクした足
+  };
+RebreakState      g_rb[2];
+double            g_rbLevel[2];                        // 待機中の基準ライン（新しい足で更新）
+double            g_rbUsed[2];                         // エントリー済みの基準ライン
+datetime          g_rbBarTime      = 0;
 int               g_hATRH          = INVALID_HANDLE;
 double            g_pip            = 0.1;
 string            g_bbName         = "";
@@ -262,7 +286,8 @@ int OnInit()
    g_noPanel = g_tester && !(bool)MQLInfoInteger(MQL_VISUAL_MODE);
 
    if(InpLot <= 0 || InpGridCount < 0 || InpGridStep <= 0 || InpMicroTP <= 0 || InpBBPeriod < 2 || InpATRPeriod < 1 || InpMaxGridsPerSide < 1 ||
-      InpTrendEntryDev <= 0 || InpTrendEntryDev >= InpBBDev || InpTrendLookback < 0)
+      InpTrendEntryDev <= 0 || InpTrendEntryDev >= InpBBDev || InpTrendLookback < 0 ||
+      InpRbLookback < 1 || InpRbRunATR <= 0 || InpRbPullATR < 0 || InpRbFailATR <= InpRbPullATR || InpRbMaxBars < 0)
      {
       Print(LOG_TAG + "ロット・本数・間隔・利確幅・期間の設定を確認してください。");
       return(INIT_PARAMETERS_INCORRECT);
@@ -354,6 +379,13 @@ int OnInit()
       g_gridStep[s]      = 0.0;
       g_gridTime[s]      = 0;
       g_armUsed[s]       = 0;
+      g_rb[s].stage      = 0;
+      g_rb[s].level      = 0.0;
+      g_rb[s].ext        = 0.0;
+      g_rb[s].atr        = 0.0;
+      g_rb[s].breakTime  = 0;
+      g_rbLevel[s]       = 0.0;
+      g_rbUsed[s]        = 0.0;
       for(int r = 0; r < RES_SLOTS; r++)
         {
          g_resRate[s][r] = 0.0;
@@ -372,7 +404,7 @@ int OnInit()
 //--- 起動直後の足ではエントリーしない
    g_lastBarTime = iTime(_Symbol, g_entryTF, 0);
 
-   PrintFormat("%s起動 v4.50：口座通貨=%s／自動化=%s／方式=%s／エントリー足=%s／上位足=%s／SELL損切り=%s／BUY損切り=%s／監視Magic=%s／銘柄=%s",
+   PrintFormat("%s起動 v4.60：口座通貨=%s／自動化=%s／方式=%s／エントリー足=%s／上位足=%s／SELL損切り=%s／BUY損切り=%s／監視Magic=%s／銘柄=%s",
                LOG_TAG, g_currency, AutoModeText(g_autoMode), EntryModeText(), TFName(g_entryTF),
                (InpUseHTF ? TFName(InpHTF) : "OFF"),
                FormatMoney(g_slAmt[SIDE_SELL]), FormatMoney(g_slAmt[SIDE_BUY]),
@@ -433,6 +465,7 @@ void MainLoop()
    CheckTarget();    // 1'') 目標利益の到達チェック
    CheckNewBar();    // 2) 逆張り：新しい足でシグナル判定
    CheckTrendEntry();// 2') 順張り：±2σ到達→±1.3σ戻りを監視
+   CheckRebreak();   // 2'') 再ブレイク：ブレイク→走る→戻る→再ブレイクを監視
    CheckReservations(); // 2'') レート予約の到達チェック
    ManageOwn();      // 3) 自EAポジションの微益利確・最有利ポジ管理
    RefreshPanel(false);
@@ -702,11 +735,225 @@ datetime LastExtremeTouch(const int side)
   }
 
 //+------------------------------------------------------------------+
+//|                                                                  |
+//|   ■ 再ブレイク                                                    |
+//|     BUY ：直近N本の高値を上抜け → ATR×倍率以上走る → 高値の内側へ   |
+//|           ATR×倍率以上戻る → 高値を再び上抜けたら買い              |
+//|     SELL：上記の逆（直近N本の安値）                                 |
+//|     判定は現在値（Bid）でリアルタイム。基準ラインは新しい足で更新    |
+//|                                                                  |
+//+------------------------------------------------------------------+
+void CheckRebreak()
+  {
+   if(InpEntryMode != ENTRY_REBREAK)
+      return;
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   if(bid <= 0)
+      return;
+
+//--- 新しい足：待機中の基準ライン（直近N本の高値・安値）を更新し、期限切れを確認
+   datetime t0 = iTime(_Symbol, g_entryTF, 0);
+   if(t0 == 0)
+      return;
+   if(t0 != g_rbBarTime)
+     {
+      int hi = iHighest(_Symbol, g_entryTF, MODE_HIGH, InpRbLookback, 1);
+      int lo = iLowest(_Symbol, g_entryTF, MODE_LOW, InpRbLookback, 1);
+      if(hi < 0 || lo < 0)
+         return;   // データ未取得：次回やり直す
+      g_rbLevel[SIDE_BUY]  = iHigh(_Symbol, g_entryTF, hi);
+      g_rbLevel[SIDE_SELL] = iLow(_Symbol, g_entryTF, lo);
+      g_rbBarTime = t0;
+      for(int s = 0; s < 2; s++)
+         if(g_rb[s].stage > 0 && InpRbMaxBars > 0 && iBarShift(_Symbol, g_entryTF, g_rb[s].breakTime) > InpRbMaxBars)
+            RebreakReset(s, "期限切れ（ブレイクから" + IntegerToString(InpRbMaxBars) + "本経過）");
+     }
+
+   for(int side = 0; side < 2; side++)
+     {
+      if((side == SIDE_BUY && !InpAllowBuy) || (side == SIDE_SELL && !InpAllowSell))
+         continue;
+      RebreakSide(side, bid);
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| 1方向分の状態遷移                                                 |
+//|   stage 0：ブレイク待ち → 1：走り待ち → 2：戻り待ち → 3：再ブレイク待ち |
+//+------------------------------------------------------------------+
+void RebreakSide(const int side, const double bid)
+  {
+   bool buy = (side == SIDE_BUY);
+
+//--- 0：ブレイク待ち
+   if(g_rb[side].stage == 0)
+     {
+      double wl = g_rbLevel[side];
+      if(wl <= 0 || wl == g_rbUsed[side])
+         return;   // エントリー済みのラインでは繰り返さない（新しい足でラインが更新されるまで）
+      if(!(buy ? bid > wl : bid < wl))
+         return;
+      double wa = Buf(g_hATR, 0, 1);
+      if(wa == EMPTY_VALUE || wa <= 0)
+         return;
+      g_rb[side].stage     = 1;
+      g_rb[side].level     = wl;
+      g_rb[side].ext       = bid;
+      g_rb[side].atr       = wa;
+      g_rb[side].breakTime = iTime(_Symbol, g_entryTF, 0);
+      return;
+     }
+
+   double lvl = g_rb[side].level;
+   double atr = g_rb[side].atr;
+   double out = buy ? bid - lvl : lvl - bid;   // 基準ラインより外側への距離（内側はマイナス）
+   if(buy ? bid > g_rb[side].ext : bid < g_rb[side].ext)
+      g_rb[side].ext = bid;
+
+//--- 1：走り待ち（走る前に内側へ戻ったらブレイク失敗。同じラインで判定し直す）
+   if(g_rb[side].stage == 1)
+     {
+      if(out < 0)
+        {
+         g_rb[side].stage = 0;
+         return;
+        }
+      if(out >= atr * InpRbRunATR)
+        {
+         g_rb[side].stage = 2;
+         PrintFormat("%s再ブレイク%s：%s %s をブレイクし %s まで走った（ATR×%.1f）→ 戻り待ち", LOG_TAG, SideName(side),
+                     (buy ? "高値" : "安値"), PriceText(lvl), PriceText(bid), InpRbRunATR);
+        }
+      return;
+     }
+
+//--- 2・3：内側へ深く戻りすぎたら無効
+   if(out <= -atr * InpRbFailATR)
+     {
+      RebreakReset(side, StringFormat("戻りが深すぎ（%s が%s %s からATR×%.1f以上内側）", PriceText(bid),
+                                      (buy ? "高値" : "安値"), PriceText(lvl), InpRbFailATR));
+      return;
+     }
+
+//--- 2：戻り待ち
+   if(g_rb[side].stage == 2)
+     {
+      if(out <= -atr * InpRbPullATR)
+        {
+         g_rb[side].stage = 3;
+         PrintFormat("%s再ブレイク%s：%s まで戻り（%s %s の内側）→ 再ブレイク待ち", LOG_TAG, SideName(side),
+                     PriceText(bid), (buy ? "高値" : "安値"), PriceText(lvl));
+        }
+      return;
+     }
+
+//--- 3：再ブレイク待ち
+   if(out <= 0)
+      return;
+
+   g_rbUsed[side]   = lvl;
+   g_rb[side].stage = 0;
+
+   string reason = "";
+   bool   ok     = EntryAllowed(side, false, reason);
+   string msg    = StringFormat("再ブレイク%sシグナル（%s）：%s %s をブレイク→%s まで走り→戻り→現在値 %s で再ブレイク",
+                                SideName(side), TFName(g_entryTF), (buy ? "高値" : "安値"), PriceText(lvl),
+                                PriceText(g_rb[side].ext), PriceText(bid));
+   g_lastSignal = TimeToString(TimeCurrent(), TIME_DATE | TIME_MINUTES) + " " + SideName(side) +
+                  (g_autoMode == AUTO_TRADE ? (ok ? "" : "（見送り：" + reason + "）") : "（自動化OFF）");
+
+   if(g_autoMode == AUTO_TRADE)
+     {
+      if(ok)
+        {
+         Print(LOG_TAG + msg);
+         PlaceGrid(side, false);
+        }
+      else
+         Print(LOG_TAG + msg + "　→ 見送り：" + reason);
+     }
+   else
+      Print(LOG_TAG + msg + "　→ 自動化OFFのため発注なし");
+  }
+
+//+------------------------------------------------------------------+
+void RebreakReset(const int side, const string why)
+  {
+   if(g_rb[side].stage >= 2)
+      Print(LOG_TAG + "再ブレイク" + SideName(side) + "：パターン無効 → " + why);
+   g_rb[side].stage = 0;
+  }
+
+//+------------------------------------------------------------------+
+//| パネル表示用：再ブレイクの待機状態                                 |
+//+------------------------------------------------------------------+
+string RebreakStatusText(color &clr)
+  {
+   clr = clrSilver;
+   string out = "方式：再ブレイク　";
+   for(int side = 0; side < 2; side++)
+     {
+      if((side == SIDE_BUY && !InpAllowBuy) || (side == SIDE_SELL && !InpAllowSell))
+         continue;
+      bool   buy = (side == SIDE_BUY);
+      string hl  = buy ? "高値" : "安値";
+      int    st  = g_rb[side].stage;
+      if(st == 0)
+         out += StringFormat("%s：%s%sブレイク待ち", SideName(side), hl, PriceText(g_rbLevel[side]));
+      else
+         if(st == 1)
+            out += StringFormat("%s：%s%sブレイク→走り待ち", SideName(side), hl, PriceText(g_rb[side].level));
+         else
+            if(st == 2)
+               out += StringFormat("%s：走った→戻り待ち", SideName(side));
+            else
+              {
+               out += StringFormat("%s：%s%s再ブレイク待ち", SideName(side), hl, PriceText(g_rb[side].level));
+               clr = buy ? clrDeepSkyBlue : clrTomato;
+              }
+      if(InpUseHTF && !TrendSideAllowed(side))
+         out += "（上位足で見送り）";
+      out += "　";
+     }
+   return(out);
+  }
+
+//+------------------------------------------------------------------+
+//| チャートに基準ラインを表示（ブレイク後〜再ブレイク待ちの間）         |
+//+------------------------------------------------------------------+
+void DrawRebreakLines()
+  {
+   for(int side = 0; side < 2; side++)
+     {
+      string name = OBJ_PREFIX + "rb" + IntegerToString(side);
+      if(InpEntryMode != ENTRY_REBREAK || g_rb[side].stage == 0)
+        {
+         if(ObjectFind(0, name) >= 0)
+            ObjectDelete(0, name);
+         continue;
+        }
+      if(ObjectFind(0, name) < 0)
+         ObjectCreate(0, name, OBJ_HLINE, 0, 0, g_rb[side].level);
+      ObjectSetDouble(0, name, OBJPROP_PRICE, g_rb[side].level);
+      ObjectSetInteger(0, name, OBJPROP_COLOR, side == SIDE_SELL ? clrTomato : clrDeepSkyBlue);
+      ObjectSetInteger(0, name, OBJPROP_STYLE, STYLE_DOT);
+      ObjectSetInteger(0, name, OBJPROP_WIDTH, 1);
+      ObjectSetInteger(0, name, OBJPROP_BACK, true);
+      ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(0, name, OBJPROP_HIDDEN, true);
+      ObjectSetString(0, name, OBJPROP_TOOLTIP, StringFormat("再ブレイク%sの基準ライン %s（%s）", SideName(side),
+                      PriceText(g_rb[side].level), (g_rb[side].stage == 1 ? "走り待ち" : (g_rb[side].stage == 2 ? "戻り待ち" : "再ブレイク待ち"))));
+     }
+  }
+
+//+------------------------------------------------------------------+
 //| パネル表示用：順張りの待機状態                                     |
 //+------------------------------------------------------------------+
 string TrendStatusText(color &clr)
   {
    clr = clrSilver;
+   if(InpEntryMode == ENTRY_REBREAK)
+      return(RebreakStatusText(clr));
    if(InpEntryMode != ENTRY_TREND)
       return(StringFormat("方式：逆張り（確定足の終値が±%.1fσの外でシグナル）", InpBBDev));
 
@@ -2461,6 +2708,8 @@ string AutoModeText(const ENUM_AUTO_MODE m)
 //+------------------------------------------------------------------+
 string EntryModeText()
   {
+   if(InpEntryMode == ENTRY_REBREAK)
+      return("再ブレイク");
    if(InpEntryMode == ENTRY_TREND)
       return("順張り");
    return("逆張り");
@@ -2688,7 +2937,7 @@ void CreatePanel()
      }
 
    MakeRect(OBJ_PREFIX + "bg", 0, 0, Px(W), Px(492), C'24,26,34', C'90,95,120');
-   MakeLabel(OBJ_PREFIX + "title", Px(6), Px(4), "裁量Nanpin v4.50", clrWhite, fs);
+   MakeLabel(OBJ_PREFIX + "title", Px(6), Px(4), "裁量Nanpin v4.60", clrWhite, fs);
    MakeButton(OBJ_PREFIX + "collapse", Px(W - 26), Px(2), Px(22), Px(20), "－", clrDimGray, clrWhite);
    SetTip(OBJ_PREFIX + "collapse", "パネルを折りたたむ（チャートを広く見る）");
    MakeLabel(OBJ_PREFIX + "status", Px(6), Px(24), "", clrLime, fs - 2);
@@ -2788,6 +3037,7 @@ void RefreshPanel(const bool force)
      {
       SetText(OBJ_PREFIX + "mini", "S " + FormatMoney(st[SIDE_SELL].profit) + "  B " + FormatMoney(st[SIDE_BUY].profit),
               (st[SIDE_SELL].profit + st[SIDE_BUY].profit) < 0 ? clrTomato : clrSilver);
+      DrawRebreakLines();
       ChartRedraw(0);
       return;
      }
@@ -2872,6 +3122,7 @@ void RefreshPanel(const bool force)
    StringReplace(ttxt, "到達待ち", "待ち");
    SetText(OBJ_PREFIX + "trend", Fit(ttxt, 24), tcol);
    SetTip(OBJ_PREFIX + "trend", ttxt);
+   DrawRebreakLines();
 
 //--- 自動化ボタン・グリッド設定
    ObjectSetString(0, OBJ_PREFIX + "auto", OBJPROP_TEXT, "自動化：" + AutoModeText(g_autoMode));
