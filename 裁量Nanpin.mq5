@@ -1,6 +1,6 @@
 //+------------------------------------------------------------------+
 //|                                                 裁量Nanpin.mq5   |
-//|   裁量Nanpin  v4.71                                               |
+//|   裁量Nanpin  v4.72                                               |
 //|   ・レート予約：SELL／BUY 各3つの入力ボックス。到達で成行＋指値     |
 //|                                                                  |
 //|   【エントリー】                                                  |
@@ -12,7 +12,7 @@
 //|     決済：終値で損切りライン割れ／第1目標で建値＋トレール／時間切れ |
 //|   ・自動化：しない／自動エントリー（パネルで切替）・通知機能なし    |
 //|   ・上位足フィルター：上位足の方向に逆らわない（押し目買い・戻り売り）|
-//|   ・ATR：チャートに表示／上限・下限で新規停止／間隔・利確幅を可変   |
+//|   ・ATR：上限・下限で新規停止／間隔・利確幅を可変（チャートには非表示）|
 //|   ・7th HEAVEN風グリッド：成行1本＋一定間隔の指値を複数本           |
 //|   ・裁量ボタン：SELL／BUY の成行グリッド、自EAポジの決済（確認なし）|
 //|   【決済】                                                        |
@@ -29,7 +29,7 @@
 //|   ・銘柄のサフィックス有無（XAUUSD／XAUUSDx／XAUUSD-m 等）を同一視  |
 //+------------------------------------------------------------------+
 #property copyright "KOHI"
-#property version   "4.71"
+#property version   "4.72"
 //--- 説明文（#property description）は MetaEditor のプロジェクト（.mqproj）側の設定と
 //--- 重複して警告が出るため記載していません。使い方は設定ガイドを参照してください。
 
@@ -134,7 +134,7 @@ input int              InpATRPeriod         = 14;                 // ATR期間
 input double           InpATRMax            = 0;                  // ATR上限（価格差・超えたら新規停止・0＝OFF）
 input double           InpATRMin            = 0;                  // ATR下限（価格差・下回ったら新規停止・0＝OFF）
 input double           InpPipSize           = 0;                  // 1pipsの価格（0＝自動：GOLDは0.1）
-input bool             InpShowIndicators    = true;               // BB・ATRをチャートに表示
+input bool             InpShowIndicators    = true;               // BBをチャートに表示
 
 input group "■ グリッド（7th HEAVEN風）"
 input double           InpLot               = 0.01;               // 1本あたりのロット
@@ -281,8 +281,6 @@ int               g_hATRH          = INVALID_HANDLE;
 double            g_pip            = 0.1;
 string            g_bbName         = "";
 int               g_bbWin          = -1;
-string            g_atrName        = "";
-int               g_atrWin         = -1;
 
 //--- 実行環境（バックテストの軽量化）
 bool              g_tester         = false;            // ストラテジーテスター
@@ -366,20 +364,13 @@ int OnInit()
    g_pip = CalcPip();
 
    g_bbName  = "";
-   g_atrName = "";
    if(InpShowIndicators && g_entryTF == (ENUM_TIMEFRAMES)_Period && !MQLInfoInteger(MQL_TESTER))
      {
-      //--- BBはメインウィンドウ、ATRは新しいサブウィンドウに表示（終了時に自分が追加した分だけ削除）
+      //--- BBをメインウィンドウに表示（終了時に自分が追加した分だけ削除）。ATRは計算のみで表示しない
       if(ChartIndicatorAdd(0, 0, g_hBB))
         {
          g_bbWin  = 0;
          g_bbName = ChartIndicatorName(0, 0, ChartIndicatorsTotal(0, 0) - 1);
-        }
-      int w = (int)ChartGetInteger(0, CHART_WINDOWS_TOTAL);
-      if(ChartIndicatorAdd(0, w, g_hATR))
-        {
-         g_atrWin  = w;
-         g_atrName = ChartIndicatorName(0, w, ChartIndicatorsTotal(0, w) - 1);
         }
      }
 
@@ -440,7 +431,7 @@ int OnInit()
 //--- 起動直後の足ではエントリーしない
    g_lastBarTime = iTime(_Symbol, g_entryTF, 0);
 
-   PrintFormat("%s起動 v4.71：口座通貨=%s／自動化=%s／方式=%s／エントリー足=%s／上位足=%s／SELL損切り=%s／BUY損切り=%s／監視Magic=%s／銘柄=%s",
+   PrintFormat("%s起動 v4.72：口座通貨=%s／自動化=%s／方式=%s／エントリー足=%s／上位足=%s／SELL損切り=%s／BUY損切り=%s／監視Magic=%s／銘柄=%s",
                LOG_TAG, g_currency, AutoModeText(g_autoMode), EntryModeText(), TFName(g_entryTF),
                (InpUseHTF ? TFName(InpHTF) : "OFF"),
                FormatMoney(g_slAmt[SIDE_SELL]), FormatMoney(g_slAmt[SIDE_BUY]),
@@ -3147,12 +3138,9 @@ double CalcPip()
 //+------------------------------------------------------------------+
 void RemoveOurIndicators()
   {
-   if(g_atrName != "" && g_atrWin >= 0)
-      ChartIndicatorDelete(0, g_atrWin, g_atrName);
    if(g_bbName != "" && g_bbWin >= 0)
       ChartIndicatorDelete(0, g_bbWin, g_bbName);
-   g_atrName = "";
-   g_bbName  = "";
+   g_bbName = "";
   }
 
 //+------------------------------------------------------------------+
@@ -3418,7 +3406,7 @@ void CreatePanel()
      }
 
    MakeRect(OBJ_PREFIX + "bg", 0, 0, Px(W), Px(492), C'24,26,34', C'90,95,120');
-   MakeLabel(OBJ_PREFIX + "title", Px(6), Px(4), "裁量Nanpin v4.71", clrWhite, fs);
+   MakeLabel(OBJ_PREFIX + "title", Px(6), Px(4), "裁量Nanpin v4.72", clrWhite, fs);
    MakeButton(OBJ_PREFIX + "collapse", Px(W - 26), Px(2), Px(22), Px(20), "－", clrDimGray, clrWhite);
    SetTip(OBJ_PREFIX + "collapse", "パネルを折りたたむ（チャートを広く見る）");
    MakeLabel(OBJ_PREFIX + "status", Px(6), Px(24), "", clrLime, fs - 2);
