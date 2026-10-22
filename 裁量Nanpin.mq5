@@ -1,6 +1,6 @@
 //+------------------------------------------------------------------+
 //|                                                 裁量Nanpin.mq5   |
-//|   裁量Nanpin  v4.30                                               |
+//|   裁量Nanpin  v4.40                                               |
 //|   ・レート予約：SELL／BUY 各3つの入力ボックス。到達で成行＋指値     |
 //|                                                                  |
 //|   【エントリー】                                                  |
@@ -15,8 +15,6 @@
 //|   【決済】                                                        |
 //|   ・不利な位置のポジションは微益利確、最有利の1本は伸ばす           |
 //|     （BBミドル到達で決済 or 裁量、建値ストップ＋トレール）          |
-//|   ・BB幅の縮小転換：拡大→縮小に転じ、価格が±2σ以内なら             |
-//|     自EAのポジションを全決済＋未約定の指値を削除                    |
 //|   【損切り監視】                                                  |
 //|   ・本EAのポジションを SELL群／BUY群 別に集計                      |
 //|   ・個別ポジ（指値約定分を含む）には損切りを置かない                |
@@ -26,7 +24,7 @@
 //|   ・銘柄のサフィックス有無（XAUUSD／XAUUSDx／XAUUSD-m 等）を同一視  |
 //+------------------------------------------------------------------+
 #property copyright "KOHI"
-#property version   "4.30"
+#property version   "4.40"
 //--- 説明文（#property description）は MetaEditor のプロジェクト（.mqproj）側の設定と
 //--- 重複して警告が出るため記載していません。使い方は設定ガイドを参照してください。
 
@@ -45,12 +43,6 @@ enum ENUM_ENTRY_MODE
   {
    ENTRY_TREND    = 0,      // 順張り（上位足の方向＋下位足の±2σ到達→±1.3σへの戻り）
    ENTRY_REVERSAL = 1       // 逆張り（確定足がバンドの外）
-  };
-
-enum ENUM_SQZ_PRICE
-  {
-   SQZ_PRICE_CLOSE = 0,     // 確定足の終値で判定（足の確定時）
-   SQZ_PRICE_LIVE  = 1      // 現在値で判定（リアルタイム）
   };
 
 enum ENUM_SIGNAL_MODE
@@ -94,14 +86,9 @@ input double           InpTrendEntryDev     = 1.3;                // 順張り�
 input int              InpTrendLookback     = 10;                 // 順張り：±2σ到達を有効とする本数（エントリー足）
 input ENUM_SIGNAL_MODE InpSignalMode        = SIG_CLOSE;          // 逆張り：シグナル条件
 
-input group "■ BB幅の縮小転換で全決済"
-input ENUM_SQZ_PRICE   InpSqzPriceMode      = SQZ_PRICE_CLOSE;    // ±2σ以内の判定に使う価格
-input int              InpSqzConfirmBars    = 1;                  // BB幅の転換とみなす連続本数（1＝1本の増減で転換）
-input bool             InpSqzExit           = true;               // BB幅が縮小に転じ±2σ以内なら全決済（どの方式でも有効）
-
 input group "■ エントリー足・ボリンジャーバンド"
 input ENUM_TIMEFRAMES  InpEntryTF           = PERIOD_CURRENT;     // エントリー足（PERIOD_CURRENT＝チャートの時間足）
-input int              InpBBPeriod          = 20;                 // BBの移動平均（ミドル）の期間 ※±σ・BB幅もこの期間で計算
+input int              InpBBPeriod          = 20;                 // BBの移動平均（ミドル）の期間 ※±σもこの期間で計算
 input double           InpBBDev             = 2.0;                // BB偏差（σ）※順張りの到達確認・逆張りの判定に使用
 input double           InpMaxSpread         = 0.50;               // 自動エントリー時の最大スプレッド（価格差・0＝無制限）
 
@@ -225,14 +212,6 @@ datetime          g_armUsed[2];                        // 順張り：使用済�
 double            g_resRate[2][RES_SLOTS];             // レート予約（0＝未設定）
 int               g_resDir[2][RES_SLOTS];              // 1＝上昇して到達、-1＝下落して到達
 ulong             g_lastTrendMs    = 0;
-//--- BB幅の縮小転換で全決済
-#define SQZ_LOOKBACK 300                               // BB幅の局面判定に使う確定足の本数
-datetime          g_sqzBarTime     = 0;                // 局面を計算した足
-int               g_sqzPhase       = 0;                // 1＝拡大中、-1＝縮小中、0＝不明
-datetime          g_sqzTurn        = 0;                // 現在の局面に切り替わった足の時刻
-datetime          g_sqzExitUsed    = 0;                // 決済済みの縮小局面（転換足の時刻）
-bool              g_sqzExitPending = false;            // 全決済の残りをリトライ中
-ulong             g_lastSqzMs      = 0;
 int               g_hATRH          = INVALID_HANDLE;
 double            g_pip            = 0.1;
 string            g_bbName         = "";
@@ -265,8 +244,7 @@ int OnInit()
    g_noPanel = g_tester && !(bool)MQLInfoInteger(MQL_VISUAL_MODE);
 
    if(InpLot <= 0 || InpGridCount < 0 || InpGridStep <= 0 || InpMicroTP <= 0 || InpBBPeriod < 2 || InpATRPeriod < 1 || InpMaxGridsPerSide < 1 ||
-      InpTrendEntryDev <= 0 || InpTrendEntryDev >= InpBBDev || InpTrendLookback < 0 ||
-      InpSqzConfirmBars < 1 || InpSqzConfirmBars > 50)
+      InpTrendEntryDev <= 0 || InpTrendEntryDev >= InpBBDev || InpTrendLookback < 0)
      {
       Print(LOG_TAG + "ロット・本数・間隔・利確幅・期間の設定を確認してください。");
       return(INIT_PARAMETERS_INCORRECT);
@@ -360,11 +338,6 @@ int OnInit()
         }
      }
    g_autoMode = InpAutoMode;
-   g_sqzBarTime      = 0;
-   g_sqzPhase        = 0;
-   g_sqzTurn         = 0;
-   g_sqzExitUsed     = 0;
-   g_sqzExitPending  = false;
 
    g_gvBase = "7HA_" + IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)) + "_" +
               g_targetCore + "_" + IntegerToString(InpMagic);
@@ -374,8 +347,8 @@ int OnInit()
 //--- 起動直後の足ではエントリーしない
    g_lastBarTime = iTime(_Symbol, g_entryTF, 0);
 
-   PrintFormat("%s起動 v4.30：口座通貨=%s／自動化=%s／方式=%s／BB幅縮小で全決済=%s／エントリー足=%s／上位足=%s／SELL損切り=%s／BUY損切り=%s／監視Magic=%s／銘柄=%s",
-               LOG_TAG, g_currency, AutoModeText(g_autoMode), EntryModeText(), (InpSqzExit ? "ON" : "OFF"), TFName(g_entryTF),
+   PrintFormat("%s起動 v4.40：口座通貨=%s／自動化=%s／方式=%s／エントリー足=%s／上位足=%s／SELL損切り=%s／BUY損切り=%s／監視Magic=%s／銘柄=%s",
+               LOG_TAG, g_currency, AutoModeText(g_autoMode), EntryModeText(), TFName(g_entryTF),
                (InpUseHTF ? TFName(InpHTF) : "OFF"),
                FormatMoney(g_slAmt[SIDE_SELL]), FormatMoney(g_slAmt[SIDE_BUY]),
                MagicListText(), ScopeText());
@@ -433,8 +406,7 @@ void MainLoop()
    GuardCheck();     // 1) 損切り監視（最優先）
    CheckNewBar();    // 2) 逆張り：新しい足でシグナル判定
    CheckTrendEntry();// 2') 順張り：±2σ到達→±1.3σ戻りを監視
-   CheckSqueeze();   // 2'') BB幅の縮小転換で全決済
-   CheckReservations(); // 2''') レート予約の到達チェック
+   CheckReservations(); // 2'') レート予約の到達チェック
    ManageOwn();      // 3) 自EAポジションの微益利確・最有利ポジ管理
    RefreshPanel(false);
   }
@@ -698,191 +670,6 @@ datetime LastExtremeTouch(const int side)
         }
      }
    return(0);
-  }
-
-//+------------------------------------------------------------------+
-//|                                                                  |
-//|   ■ BB幅の縮小転換で全決済                                         |
-//|     BB幅が拡大→縮小に転じ、価格が±2σ以内なら全決済                 |
-//|                                                                  |
-//+------------------------------------------------------------------+
-void CheckSqueeze()
-  {
-   if(!InpSqzExit)
-      return;
-
-//--- 全決済の残り（決済失敗分）をリトライ（1秒間隔）
-   if(g_sqzExitPending)
-      SqueezeCloseAll(true);
-
-//--- BB幅の局面は確定足だけで決まるので、新しい足でだけ計算し直す（足の切替は間引かずに検出）
-   datetime t = iTime(_Symbol, g_entryTF, 0);
-   if(t == 0)
-      return;
-   bool newBar = false;
-   if(t != g_sqzBarTime)
-     {
-      int      ph = 0;
-      datetime tn = 0;
-      if(!WidthPhase(ph, tn))
-         return;   // データ未取得：次回やり直す
-      newBar            = (g_sqzBarTime != 0);   // 起動直後の足では確定足判定をしない
-      g_sqzBarTime      = t;
-      g_sqzPhase        = ph;
-      g_sqzTurn         = tn;
-     }
-
-   bool live = (InpSqzPriceMode == SQZ_PRICE_LIVE);
-   if(!live && !newBar)
-      return;
-   if(live)
-     {
-      ulong now = NowMs();
-      if(g_lastSqzMs != 0 && (now - g_lastSqzMs) < 250)
-         return;
-      g_lastSqzMs = now;
-     }
-   SqueezeExit(live);
-  }
-
-//+------------------------------------------------------------------+
-//| BB幅の局面（確定足で判定）                                         |
-//|   phase：1＝拡大中、-1＝縮小中、0＝不明                            |
-//|   turn ：現在の局面に切り替わった足（増減が始まった足）の時刻       |
-//|   幅が前の足より増えた足を「拡大」、減った足を「縮小」とし、        |
-//|   逆向きが InpSqzConfirmBars 本続いたら局面が切り替わったとみなす   |
-//+------------------------------------------------------------------+
-bool WidthPhase(int &phase, datetime &turn)
-  {
-   phase = 0;
-   turn  = 0;
-
-   int cnt = SQZ_LOOKBACK + 1;
-   double   up[];
-   double   lo[];
-   datetime tm[];
-   ArraySetAsSeries(up, true);
-   ArraySetAsSeries(lo, true);
-   ArraySetAsSeries(tm, true);
-   if(CopyBuffer(g_hBB, 1, 1, cnt, up) != cnt || CopyBuffer(g_hBB, 2, 1, cnt, lo) != cnt ||
-      CopyTime(_Symbol, g_entryTF, 1, cnt, tm) != cnt)
-      return(false);
-
-//--- 配列の添字 j はシフト j+1 の足。古い足から順に見ていく
-   int run      = 0;
-   int runDir   = 0;
-   int runStart = -1;
-   for(int j = cnt - 2; j >= 0; j--)
-     {
-      if(up[j] == EMPTY_VALUE || lo[j] == EMPTY_VALUE || up[j + 1] == EMPTY_VALUE || lo[j + 1] == EMPTY_VALUE)
-         continue;
-      double d   = (up[j] - lo[j]) - (up[j + 1] - lo[j + 1]);
-      int    dir = (d > 0) ? 1 : ((d < 0) ? -1 : 0);
-      if(dir == 0)
-         continue;
-      if(dir == phase)
-        {
-         run    = 0;
-         runDir = 0;
-         continue;
-        }
-      if(dir == runDir)
-         run++;
-      else
-        {
-         runDir   = dir;
-         run      = 1;
-         runStart = j;
-        }
-      if(run >= InpSqzConfirmBars)
-        {
-         phase  = dir;
-         turn   = tm[runStart];
-         run    = 0;
-         runDir = 0;
-        }
-     }
-   return(true);
-  }
-
-//+------------------------------------------------------------------+
-//| BB幅の縮小転換による全決済（縮小局面ごとに1回）                     |
-//+------------------------------------------------------------------+
-void SqueezeExit(const bool live)
-  {
-   if(g_sqzPhase != -1 || g_sqzTurn == 0 || g_sqzTurn <= g_sqzExitUsed)
-      return;
-
-   int    shift = live ? 0 : 1;
-   double px    = live ? SymbolInfoDouble(_Symbol, SYMBOL_BID) : iClose(_Symbol, g_entryTF, 1);
-   double up    = Buf(g_hBB, 1, shift);
-   double lo    = Buf(g_hBB, 2, shift);
-   if(px <= 0 || up == EMPTY_VALUE || lo == EMPTY_VALUE)
-      return;
-   if(px > up || px < lo)
-      return;   // ±2σの外：まだ決済しない
-
-//--- この縮小局面の決済判定はこれで確定（以後に建てたポジションは対象外）
-   g_sqzExitUsed = g_sqzTurn;
-   SaveState();
-
-   int pos = CountOwnPositions(SIDE_SELL) + CountOwnPositions(SIDE_BUY);
-   int ord = CountOwnOrders(SIDE_SELL) + CountOwnOrders(SIDE_BUY);
-   if(pos == 0 && ord == 0)
-      return;
-
-   string msg = StringFormat("BB幅が縮小に転換（%s〜）、%s %s が±%.1fσ以内（%s〜%s）",
-                             TimeToString(g_sqzTurn, TIME_DATE | TIME_MINUTES), (live ? "現在値" : "終値"),
-                             PriceText(px), InpBBDev, PriceText(lo), PriceText(up));
-   if(g_autoMode != AUTO_TRADE)
-     {
-      Print(LOG_TAG + msg + "　→ 自動化OFFのため決済なし（ポジ" + IntegerToString(pos) + "件・指値" + IntegerToString(ord) + "件）");
-      return;
-     }
-   Print(LOG_TAG + msg + "　→ 全決済");
-   SqueezeCloseAll(false);
-  }
-
-//+------------------------------------------------------------------+
-//| 自EAのポジションを全決済し、未約定の指値を全削除                    |
-//+------------------------------------------------------------------+
-void SqueezeCloseAll(const bool retry)
-  {
-   static ulong lastMs = 0;
-   ulong now = NowMs();
-   if(retry && lastMs != 0 && (now - lastMs) < 1000)
-      return;
-   lastMs = now;
-
-   int del    = 0;
-   int closed = 0;
-   for(int s = 0; s < 2; s++)
-     {
-      if(g_closing[s])
-         continue;   // 損切り決済中の群は損切り側に任せる
-      del += DeleteOwnOrders(s);
-      int total = PositionsTotal();
-      for(int i = total - 1; i >= 0; i--)
-        {
-         ulong ticket = PositionGetTicket(i);
-         if(ticket == 0 || !IsOwnPositionSelected() || PositionSideSelected() != s)
-            continue;
-         if(ClosePositionTicket(ticket))
-            closed++;
-        }
-      g_gridTime[s] = 0;
-     }
-   SaveState();
-
-   int remain = 0;
-   for(int s = 0; s < 2; s++)
-      if(!g_closing[s])
-         remain += CountOwnPositions(s) + CountOwnOrders(s);
-
-   if(!retry || closed > 0 || del > 0)
-      SetAction(StringFormat("BB幅の縮小転換で全決済：ポジ%d件決済・指値%d件削除%s", closed, del,
-                             (remain > 0 ? StringFormat("／残り%d件は決済失敗（再試行中）", remain) : "")));
-   g_sqzExitPending = (remain > 0);
   }
 
 //+------------------------------------------------------------------+
@@ -2250,7 +2037,6 @@ void SaveState()
    GlobalVariableSet(g_gvBase + "_auto", (double)g_autoMode);
    GlobalVariableSet(g_gvBase + "_gseq", (double)g_gridSeq);
    GlobalVariableSet(g_gvBase + "_fold", g_collapsed ? 1.0 : 0.0);
-   GlobalVariableSet(g_gvBase + "_sqzOut", (double)g_sqzExitUsed);
    for(int s = 0; s < 2; s++)
      {
       string k = g_gvBase + "_" + SideKey(s);
@@ -2288,8 +2074,6 @@ void LoadState()
       g_gridSeq = (int)GlobalVariableGet(g_gvBase + "_gseq");
    if(GlobalVariableCheck(g_gvBase + "_fold"))
       g_collapsed = (GlobalVariableGet(g_gvBase + "_fold") > 0.5);
-   if(GlobalVariableCheck(g_gvBase + "_sqzOut"))
-      g_sqzExitUsed = (datetime)(long)GlobalVariableGet(g_gvBase + "_sqzOut");
 
    for(int s = 0; s < 2; s++)
      {
@@ -2724,7 +2508,7 @@ void CreatePanel()
      }
 
    MakeRect(OBJ_PREFIX + "bg", 0, 0, Px(W), Px(466), C'24,26,34', C'90,95,120');
-   MakeLabel(OBJ_PREFIX + "title", Px(6), Px(4), "裁量Nanpin v4.30", clrWhite, fs);
+   MakeLabel(OBJ_PREFIX + "title", Px(6), Px(4), "裁量Nanpin v4.40", clrWhite, fs);
    MakeButton(OBJ_PREFIX + "collapse", Px(W - 26), Px(2), Px(22), Px(20), "－", clrDimGray, clrWhite);
    SetTip(OBJ_PREFIX + "collapse", "パネルを折りたたむ（チャートを広く見る）");
    MakeLabel(OBJ_PREFIX + "status", Px(6), Px(24), "", clrLime, fs - 2);
@@ -2898,10 +2682,6 @@ void RefreshPanel(const bool force)
    StringReplace(ttxt, "到達済 → ", "済→");
    StringReplace(ttxt, "到達待ち", "待ち");
    SetText(OBJ_PREFIX + "trend", Fit(ttxt, 24), tcol);
-   if(InpSqzExit)
-      ttxt += "\nBB幅：" + (g_sqzPhase == 1 ? "拡大中" : (g_sqzPhase == -1 ? "縮小中" : "判定中")) +
-              (g_sqzTurn > 0 ? "（" + TimeToString(g_sqzTurn, TIME_DATE | TIME_MINUTES) + "〜）" : "") +
-              "　縮小に転じ±" + DoubleToString(InpBBDev, 1) + "σ以内で全決済";
    SetTip(OBJ_PREFIX + "trend", ttxt);
 
 //--- 自動化ボタン・グリッド設定
