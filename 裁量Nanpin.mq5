@@ -1,6 +1,6 @@
 //+------------------------------------------------------------------+
 //|                                                 裁量Nanpin.mq5   |
-//|   裁量Nanpin  v4.40                                               |
+//|   裁量Nanpin  v4.50                                               |
 //|   ・レート予約：SELL／BUY 各3つの入力ボックス。到達で成行＋指値     |
 //|                                                                  |
 //|   【エントリー】                                                  |
@@ -11,10 +11,12 @@
 //|   ・上位足フィルター：上位足の方向に逆らわない（押し目買い・戻り売り）|
 //|   ・ATR：チャートに表示／上限・下限で新規停止／間隔・利確幅を可変   |
 //|   ・7th HEAVEN風グリッド：成行1本＋一定間隔の指値を複数本           |
-//|   ・裁量ボタン：SELL／BUY の成行グリッド、自EAポジの決済            |
+//|   ・裁量ボタン：SELL／BUY の成行グリッド、自EAポジの決済（確認なし）|
 //|   【決済】                                                        |
 //|   ・不利な位置のポジションは微益利確、最有利の1本は伸ばす           |
 //|     （BBミドル到達で決済 or 裁量、建値ストップ＋トレール）          |
+//|   ・目標利益：自EAの合計損益が目標額に達したら全決済＋指値削除      |
+//|   ・一括決済・指値削除は非同期で一斉送信（高速化）                  |
 //|   【損切り監視】                                                  |
 //|   ・本EAのポジションを SELL群／BUY群 別に集計                      |
 //|   ・個別ポジ（指値約定分を含む）には損切りを置かない                |
@@ -24,7 +26,7 @@
 //|   ・銘柄のサフィックス有無（XAUUSD／XAUUSDx／XAUUSD-m 等）を同一視  |
 //+------------------------------------------------------------------+
 #property copyright "KOHI"
-#property version   "4.40"
+#property version   "4.50"
 //--- 説明文（#property description）は MetaEditor のプロジェクト（.mqproj）側の設定と
 //--- 重複して警告が出るため記載していません。使い方は設定ガイドを参照してください。
 
@@ -131,11 +133,14 @@ input double           InpSL_Other          = 0;                  // その他�
 input bool             InpIncludeSwap       = false;              // スワップを含めて判定
 input bool             InpIncludeCommission = false;              // 手数料（新規約定分）を含めて判定
 
+input group "■ 目標利益"
+input double           InpTargetProfit      = 0;                  // 目標利益の初期値（自EAの合計損益がこの額に達したら全決済・口座通貨・0＝OFF・パネルで随時変更可）
+
 input group "■ 損切り監視：発動時の動作"
 input ENUM_DEL_ORDERS  InpDeleteOrders      = DEL_ALL;            // 未約定の指値・逆指値の扱い
 input bool             InpLockAfterSL       = true;               // 発動した方向をロック（解除ボタンまで新規注文削除・新規ポジ即決済）
 input int              InpDeviationPoints   = 100;                // 許容スリッページ（ポイント）※GOLD 2桁なら100＝1ドル
-input int              InpMaxRetry          = 5;                  // 1回あたりの決済リトライ回数
+input int              InpMaxRetry          = 5;                  // 決済が残った時に警告を出すまでの再送回数（1秒間隔で再送し続ける）
 input bool             InpDryRun            = false;              // 損切りのテストモード（判定のみ・決済しない）
 
 input group "■ レート予約（7th HEAVEN風の入力ボックス）"
@@ -167,6 +172,7 @@ struct SideStat
   };
 
 CTrade            g_trade;
+CTrade            g_fast;      // 一括決済・指値削除用（非同期：応答を待たずに一斉送信）
 
 //--- 監視対象（本EAのみ）
 string            g_targetCore     = "";
@@ -190,6 +196,7 @@ bool              g_lockNotified[2];
 double            g_balanceBefore[2];
 double            g_triggerProfit[2];
 int               g_closedCount[2];
+int               g_closeTries[2];
 int               g_deletedCount[2];
 ulong             g_lastTryMs[2];
 ulong             g_lastLockMs[2];
@@ -223,6 +230,17 @@ int               g_atrWin         = -1;
 bool              g_tester         = false;            // ストラテジーテスター
 bool              g_noPanel        = false;            // パネルを描かない（ビジュアルモードでないテスター）
 ulong             g_lastPanelMs    = 0;
+
+//--- 一括決済（決済ボタン・目標利益）
+bool              g_flatActive     = false;
+int               g_flatSide       = -1;               // -1＝SELL・BUY両方
+string            g_flatReason     = "";
+int               g_flatPos        = 0;                // 開始時のポジ数
+int               g_flatOrd        = 0;                // 開始時の指値数
+int               g_flatTries      = 0;
+ulong             g_flatStartMs    = 0;
+ulong             g_flatSendMs     = 0;
+double            g_targetAmt      = 0.0;              // 目標利益（0＝OFF）
 
 int               g_failPrintCount = 0;
 string            g_lastEvent      = "";
@@ -309,6 +327,10 @@ int OnInit()
    g_trade.SetDeviationInPoints((ulong)MathMax(0, InpDeviationPoints));
    g_trade.SetAsyncMode(false);
    g_trade.LogLevel(LOG_LEVEL_ERRORS);
+   g_fast.SetExpertMagicNumber((ulong)InpMagic);
+   g_fast.SetDeviationInPoints((ulong)MathMax(0, InpDeviationPoints));
+   g_fast.SetAsyncMode(true);
+   g_fast.LogLevel(LOG_LEVEL_ERRORS);
 
 //--- 状態初期化
    for(int s = 0; s < 2; s++)
@@ -324,6 +346,7 @@ int OnInit()
       g_balanceBefore[s] = 0.0;
       g_triggerProfit[s] = 0.0;
       g_closedCount[s]   = 0;
+      g_closeTries[s]    = 0;
       g_deletedCount[s]  = 0;
       g_lastTryMs[s]     = 0;
       g_lastLockMs[s]    = 0;
@@ -338,6 +361,8 @@ int OnInit()
         }
      }
    g_autoMode = InpAutoMode;
+   g_targetAmt   = MathAbs(InpTargetProfit);
+   g_flatActive  = false;
 
    g_gvBase = "7HA_" + IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)) + "_" +
               g_targetCore + "_" + IntegerToString(InpMagic);
@@ -347,7 +372,7 @@ int OnInit()
 //--- 起動直後の足ではエントリーしない
    g_lastBarTime = iTime(_Symbol, g_entryTF, 0);
 
-   PrintFormat("%s起動 v4.40：口座通貨=%s／自動化=%s／方式=%s／エントリー足=%s／上位足=%s／SELL損切り=%s／BUY損切り=%s／監視Magic=%s／銘柄=%s",
+   PrintFormat("%s起動 v4.50：口座通貨=%s／自動化=%s／方式=%s／エントリー足=%s／上位足=%s／SELL損切り=%s／BUY損切り=%s／監視Magic=%s／銘柄=%s",
                LOG_TAG, g_currency, AutoModeText(g_autoMode), EntryModeText(), TFName(g_entryTF),
                (InpUseHTF ? TFName(InpHTF) : "OFF"),
                FormatMoney(g_slAmt[SIDE_SELL]), FormatMoney(g_slAmt[SIDE_BUY]),
@@ -404,6 +429,8 @@ void OnTimer()
 void MainLoop()
   {
    GuardCheck();     // 1) 損切り監視（最優先）
+   ProcessFlatten(); // 1') 一括決済（決済ボタン・目標利益）の完了確認・再送
+   CheckTarget();    // 1'') 目標利益の到達チェック
    CheckNewBar();    // 2) 逆張り：新しい足でシグナル判定
    CheckTrendEntry();// 2') 順張り：±2σ到達→±1.3σ戻りを監視
    CheckReservations(); // 2'') レート予約の到達チェック
@@ -438,6 +465,8 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam, const 
       for(int s = 0; s < 2; s++)
          if(sparam == ObjName("edit", s))
             ApplyEdit(s);
+      if(sparam == OBJ_PREFIX + "tgt")
+         ApplyTarget();
      }
 
    if(id == CHARTEVENT_OBJECT_CLICK)
@@ -782,6 +811,11 @@ bool EntryAllowed(const int side, const bool manual, string &reason)
       reason = "損切り決済中";
       return(false);
      }
+   if(g_flatActive && FlatSide(side))
+     {
+      reason = "一括決済の処理中";
+      return(false);
+     }
    if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) || !MQLInfoInteger(MQL_TRADE_ALLOWED))
      {
       reason = "自動売買が無効（MT5の「アルゴリズム取引」ボタンとEAの設定を確認）";
@@ -959,25 +993,159 @@ void ManualCloseOwn(const int side)
       SetAction("【" + SideName(side) + "】決済するポジション・注文はありません");
       return;
      }
-   string q = StringFormat("このEAの%sポジション%d件を決済し、指値%d件を削除しますか？",
-                           SideName(side), pos, ord);
-   if(MessageBox(q, "裁量Nanpin", MB_YESNO | MB_ICONQUESTION) != IDYES)
+   StartFlatten(side, "【" + SideName(side) + "】裁量決済");   // 確認なしで即実行
+  }
+
+//+------------------------------------------------------------------+
+//|                                                                  |
+//|   ■ 一括決済（決済ボタン・目標利益）                               |
+//|     自EAの指値削除・ポジション決済を非同期で一斉に送信し、           |
+//|     完了するまで1秒ごとに残りを再送する                             |
+//|                                                                  |
+//+------------------------------------------------------------------+
+bool FlatSide(const int side)
+  {
+   return(g_flatSide < 0 || g_flatSide == side);
+  }
+
+//+------------------------------------------------------------------+
+void StartFlatten(const int sideFilter, const string reason)
+  {
+//--- 別方向の一括決済が進行中なら、両方向にまとめる
+   int sf = sideFilter;
+   if(g_flatActive && g_flatSide != sideFilter)
+      sf = -1;
+
+   g_flatSide   = sf;
+   g_flatReason = (g_flatActive && sf != sideFilter) ? g_flatReason + "＋" + reason : reason;
+   g_flatPos    = 0;
+   g_flatOrd    = 0;
+   for(int s = 0; s < 2; s++)
+     {
+      if(!FlatSide(s))
+         continue;
+      g_flatPos += CountOwnPositions(s);
+      g_flatOrd += CountOwnOrders(s);
+      g_gridTime[s] = 0;
+     }
+   g_flatActive     = true;
+   g_flatTries      = 0;
+   g_flatStartMs    = NowMs();
+   g_failPrintCount = 0;
+   SaveState();
+   SendFlatten();
+   ProcessFlatten();   // テスター等で即時に約定していれば、その場で完了表示
+  }
+
+//+------------------------------------------------------------------+
+//| 対象の指値削除・ポジション決済を一斉送信（応答は待たない）           |
+//+------------------------------------------------------------------+
+void SendFlatten()
+  {
+   g_flatSendMs = NowMs();
+   g_flatTries++;
+   for(int s = 0; s < 2; s++)
+     {
+      if(!FlatSide(s))
+         continue;
+      DeleteOwnOrders(s, true);   // 指値を先に送る（決済中に約定させない）
+      int total = PositionsTotal();
+      for(int i = total - 1; i >= 0; i--)
+        {
+         ulong ticket = PositionGetTicket(i);
+         if(ticket == 0 || !IsOwnPositionSelected() || PositionSideSelected() != s)
+            continue;
+         ClosePositionTicket(ticket, true);
+        }
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| 完了確認：残りがあれば1秒ごとに再送                                 |
+//+------------------------------------------------------------------+
+void ProcessFlatten()
+  {
+   if(!g_flatActive)
       return;
 
-   int del = DeleteOwnOrders(side);
-   int closed = 0;
+   int remain = 0;
+   for(int s = 0; s < 2; s++)
+      if(FlatSide(s))
+         remain += CountOwnPositions(s) + CountOwnOrders(s);
+
+   if(remain == 0)
+     {
+      g_flatActive = false;
+      SetAction(StringFormat("%s：ポジ%d件決済・指値%d件削除（%.2f秒）", g_flatReason, g_flatPos, g_flatOrd,
+                             (double)(NowMs() - g_flatStartMs) / 1000.0));
+      return;
+     }
+
+   if(NowMs() - g_flatSendMs < 1000)
+      return;   // 送信済みの注文の処理待ち
+   if(g_flatTries == 3)
+      SetAction(StringFormat("%s：残り%d件の決済・削除に失敗しています。再試行中（自動売買ON・市場オープンを確認してください）",
+                             g_flatReason, remain));
+   SendFlatten();
+  }
+
+//+------------------------------------------------------------------+
+//| 目標利益：自EAの合計損益が目標額に達したら全決済                    |
+//+------------------------------------------------------------------+
+void CheckTarget()
+  {
+   if(g_targetAmt <= 0 || g_flatActive || g_closing[SIDE_SELL] || g_closing[SIDE_BUY])
+      return;
+   int    n = 0;
+   double p = OwnProfit(n);
+   if(n == 0 || p < g_targetAmt)
+      return;
+   StartFlatten(-1, StringFormat("目標利益到達（合計 %s ≧ %s）で全決済", FormatMoney(p), FormatMoney(g_targetAmt)));
+  }
+
+//+------------------------------------------------------------------+
+//| 自EAのポジションの合計損益（スワップ・手数料は損切り監視の設定に従う）|
+//+------------------------------------------------------------------+
+double OwnProfit(int &count)
+  {
+   count = 0;
+   double sum = 0.0;
    int total = PositionsTotal();
    for(int i = total - 1; i >= 0; i--)
      {
       ulong ticket = PositionGetTicket(i);
-      if(ticket == 0 || !IsOwnPositionSelected() || PositionSideSelected() != side)
+      if(ticket == 0 || !IsOwnPositionSelected())
          continue;
-      if(ClosePositionTicket(ticket))
-         closed++;
+      double p = PositionGetDouble(POSITION_PROFIT);
+      if(InpIncludeSwap)
+         p += PositionGetDouble(POSITION_SWAP);
+      if(InpIncludeCommission)
+         p += GetEntryCommission((ulong)PositionGetInteger(POSITION_IDENTIFIER));
+      sum += p;
+      count++;
      }
-   g_gridTime[side] = 0;
+   return(sum);
+  }
+
+//+------------------------------------------------------------------+
+//| パネルの目標利益入力                                              |
+//+------------------------------------------------------------------+
+void ApplyTarget()
+  {
+   string name = OBJ_PREFIX + "tgt";
+   string txt  = ObjectGetString(0, name, OBJPROP_TEXT);
+   bool   ok   = false;
+   double v    = ParseAmount(txt, ok);
+   if(!ok)
+     {
+      Print(LOG_TAG + "金額として読み取れません：" + txt);
+      ObjectSetString(0, name, OBJPROP_TEXT, FormatPlain(g_targetAmt));
+      return;
+     }
+   g_targetAmt = v;
    SaveState();
-   SetAction(StringFormat("【%s】裁量決済：ポジ%d件決済・指値%d件削除", SideName(side), closed, del));
+   ObjectSetString(0, name, OBJPROP_TEXT, FormatPlain(v));
+   SetAction("目標利益を " + (v > 0 ? "+" + FormatMoney(v) : "0（OFF）") + " に変更しました");
   }
 
 //+------------------------------------------------------------------+
@@ -1000,7 +1168,7 @@ void ManageOwn()
 
    for(int side = 0; side < 2; side++)
      {
-      if(g_closing[side])
+      if(g_closing[side] || (g_flatActive && FlatSide(side)))
          continue;
 
       ulong  tk[];
@@ -1210,7 +1378,8 @@ void StartClosing(const int side, const SideStat &st)
    g_stuckNotified[side] = false;
    g_balanceBefore[side] = AccountInfoDouble(ACCOUNT_BALANCE);
    g_triggerProfit[side] = st.profit;
-   g_closedCount[side]   = 0;
+   g_closedCount[side]   = st.count;   // 発動時のポジ数（非同期で送るため、送信回数ではなく件数で表示）
+   g_closeTries[side]    = 0;
    g_deletedCount[side]  = 0;
    g_lastTryMs[side]     = 0;
    g_failPrintCount      = 0;
@@ -1220,10 +1389,10 @@ void StartClosing(const int side, const SideStat &st)
                        DeleteModeText()));
 
    if(InpDeleteOrders == DEL_ALL)
-      g_deletedCount[side] += DeleteOrders(-1);
+      g_deletedCount[side] += DeleteOrders(-1, true);
    else
       if(InpDeleteOrders == DEL_SAME)
-         g_deletedCount[side] += DeleteOrders(side);
+         g_deletedCount[side] += DeleteOrders(side, true);
 
    ProcessClosing(side);
   }
@@ -1231,30 +1400,33 @@ void StartClosing(const int side, const SideStat &st)
 //+------------------------------------------------------------------+
 void ProcessClosing(const int side)
   {
-   ulong now = NowMs();
-   if(g_lastTryMs[side] != 0 && (now - g_lastTryMs[side]) < 1000)
-      return;
-   g_lastTryMs[side] = now;
-
-   if(InpDeleteOrders != DEL_NONE)
-      g_deletedCount[side] += DeleteOrders(side);
-
+//--- 完了確認は毎回（非同期で送った決済の約定を待たずに検知する）
    int remaining = CountPositions(side);
-   int tries     = MathMax(1, InpMaxRetry);
-   for(int a = 0; a < tries && remaining > 0; a++)
-     {
-      remaining = ClosePositions(side);
-      if(remaining > 0)
-         Sleep(200);
-     }
-
    if(remaining == 0)
      {
       FinishClosing(side);
       return;
      }
 
-   if(!g_stuckNotified[side])
+//--- 非同期で一斉送信し、1秒ごとに残りを再送する（応答待ちで止まらない）
+   ulong now = NowMs();
+   if(g_lastTryMs[side] != 0 && (now - g_lastTryMs[side]) < 1000)
+      return;
+   g_lastTryMs[side] = now;
+
+   if(InpDeleteOrders != DEL_NONE && g_closeTries[side] > 0)
+      DeleteOrders(side, true);   // 発動後に出た注文の削除・再送（件数は発動時の分だけ数える）
+   ClosePositions(side, true);
+   g_closeTries[side]++;
+
+   remaining = CountPositions(side);
+   if(remaining == 0)
+     {
+      FinishClosing(side);
+      return;
+     }
+
+   if(g_closeTries[side] >= MathMax(3, InpMaxRetry) && !g_stuckNotified[side])
      {
       LogEvent(StringFormat("【%s群】未決済のポジションが%d件残っています。引き続き決済を試みます（自動売買ON・市場オープンを確認してください）",
                           SideName(side), remaining));
@@ -1301,11 +1473,8 @@ void EnforceLock(const int side, const SideStat &st)
       return;
    g_lastLockMs[side] = now;
 
-   int deleted      = DeleteOrders(side);
-   int closedBefore = g_closedCount[side];
-   if(st.count > 0)
-      ClosePositions(side);
-   int closed = g_closedCount[side] - closedBefore;
+   int deleted = DeleteOrders(side, true);
+   int closed  = (st.count > 0) ? ClosePositions(side, true) : 0;
 
    if(!g_lockNotified[side] && (deleted > 0 || closed > 0))
      {
@@ -1317,40 +1486,44 @@ void EnforceLock(const int side, const SideStat &st)
   }
 
 //+------------------------------------------------------------------+
-//| 監視対象ポジション（指定方向）を全て決済し、残数を返す               |
+//| 監視対象ポジション（指定方向）を全て決済し、送信した件数を返す       |
 //+------------------------------------------------------------------+
-int ClosePositions(const int side)
+int ClosePositions(const int side, const bool async = false)
   {
+   int sent  = 0;
    int total = PositionsTotal();
    for(int i = total - 1; i >= 0; i--)
      {
       ulong ticket = PositionGetTicket(i);
       if(ticket == 0 || !IsTargetPositionSelected() || PositionSideSelected() != side)
          continue;
-      if(ClosePositionTicket(ticket))
-         g_closedCount[side]++;
+      if(ClosePositionTicket(ticket, async))
+         sent++;
      }
-   return(CountPositions(side));
+   return(sent);
   }
 
 //+------------------------------------------------------------------+
-bool ClosePositionTicket(const ulong ticket)
+//| async＝true：応答を待たずに送信（送信できたら true）               |
+//+------------------------------------------------------------------+
+bool ClosePositionTicket(const ulong ticket, const bool async = false)
   {
    if(!PositionSelectByTicket(ticket))
       return(false);
-   string sym = PositionGetString(POSITION_SYMBOL);
-   g_trade.SetTypeFillingBySymbol(sym);
+   string  sym = PositionGetString(POSITION_SYMBOL);
+   CTrade *tr  = async ? GetPointer(g_fast) : GetPointer(g_trade);
+   tr.SetTypeFillingBySymbol(sym);
 
    ResetLastError();
-   bool ok = g_trade.PositionClose(ticket, (ulong)MathMax(0, InpDeviationPoints));
-   uint rc = g_trade.ResultRetcode();
-   if(ok && (rc == TRADE_RETCODE_DONE || rc == TRADE_RETCODE_DONE_PARTIAL || rc == TRADE_RETCODE_PLACED))
+   bool ok = tr.PositionClose(ticket, (ulong)MathMax(0, InpDeviationPoints));
+   uint rc = tr.ResultRetcode();
+   if(ok && (async || rc == TRADE_RETCODE_DONE || rc == TRADE_RETCODE_DONE_PARTIAL || rc == TRADE_RETCODE_PLACED))
       return(true);
 
    if(g_failPrintCount < 30)
      {
       PrintFormat("%s決済失敗 #%I64u %s retcode=%u（%s） err=%d",
-                  LOG_TAG, ticket, sym, rc, g_trade.ResultRetcodeDescription(), GetLastError());
+                  LOG_TAG, ticket, sym, rc, tr.ResultRetcodeDescription(), GetLastError());
       g_failPrintCount++;
      }
    return(false);
@@ -1359,7 +1532,7 @@ bool ClosePositionTicket(const ulong ticket)
 //+------------------------------------------------------------------+
 //| 監視対象の未約定注文を削除（sideFilter：-1＝全方向）               |
 //+------------------------------------------------------------------+
-int DeleteOrders(const int sideFilter)
+int DeleteOrders(const int sideFilter, const bool async = false)
   {
    int deleted = 0;
    int total   = OrdersTotal();
@@ -1371,7 +1544,7 @@ int DeleteOrders(const int sideFilter)
       int sd = OrderSideOf((ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE));
       if(sd < 0 || (sideFilter >= 0 && sd != sideFilter))
          continue;
-      if(DeleteOrderTicket(ticket))
+      if(DeleteOrderTicket(ticket, async))
          deleted++;
      }
    return(deleted);
@@ -1380,7 +1553,7 @@ int DeleteOrders(const int sideFilter)
 //+------------------------------------------------------------------+
 //| 自EAの未約定注文を削除                                            |
 //+------------------------------------------------------------------+
-int DeleteOwnOrders(const int side)
+int DeleteOwnOrders(const int side, const bool async = false)
   {
    int deleted = 0;
    int total   = OrdersTotal();
@@ -1391,24 +1564,25 @@ int DeleteOwnOrders(const int side)
          continue;
       if(OrderSideOf((ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE)) != side)
          continue;
-      if(DeleteOrderTicket(ticket))
+      if(DeleteOrderTicket(ticket, async))
          deleted++;
      }
    return(deleted);
   }
 
 //+------------------------------------------------------------------+
-bool DeleteOrderTicket(const ulong ticket)
+bool DeleteOrderTicket(const ulong ticket, const bool async = false)
   {
+   CTrade *tr = async ? GetPointer(g_fast) : GetPointer(g_trade);
    ResetLastError();
-   bool ok = g_trade.OrderDelete(ticket);
-   uint rc = g_trade.ResultRetcode();
-   if(ok && (rc == TRADE_RETCODE_DONE || rc == TRADE_RETCODE_PLACED))
+   bool ok = tr.OrderDelete(ticket);
+   uint rc = tr.ResultRetcode();
+   if(ok && (async || rc == TRADE_RETCODE_DONE || rc == TRADE_RETCODE_PLACED))
       return(true);
    if(g_failPrintCount < 30)
      {
       PrintFormat("%s注文削除失敗 #%I64u retcode=%u（%s） err=%d",
-                  LOG_TAG, ticket, rc, g_trade.ResultRetcodeDescription(), GetLastError());
+                  LOG_TAG, ticket, rc, tr.ResultRetcodeDescription(), GetLastError());
       g_failPrintCount++;
      }
    return(false);
@@ -2037,6 +2211,8 @@ void SaveState()
    GlobalVariableSet(g_gvBase + "_auto", (double)g_autoMode);
    GlobalVariableSet(g_gvBase + "_gseq", (double)g_gridSeq);
    GlobalVariableSet(g_gvBase + "_fold", g_collapsed ? 1.0 : 0.0);
+   GlobalVariableSet(g_gvBase + "_tgtInit", MathAbs(InpTargetProfit));
+   GlobalVariableSet(g_gvBase + "_tgt", g_targetAmt);
    for(int s = 0; s < 2; s++)
      {
       string k = g_gvBase + "_" + SideKey(s);
@@ -2074,6 +2250,10 @@ void LoadState()
       g_gridSeq = (int)GlobalVariableGet(g_gvBase + "_gseq");
    if(GlobalVariableCheck(g_gvBase + "_fold"))
       g_collapsed = (GlobalVariableGet(g_gvBase + "_fold") > 0.5);
+//--- 目標利益：入力の初期値を変えていなければ、パネルで変更した値を引き継ぐ
+   if(GlobalVariableCheck(g_gvBase + "_tgtInit") && GlobalVariableCheck(g_gvBase + "_tgt") &&
+      MathAbs(GlobalVariableGet(g_gvBase + "_tgtInit") - MathAbs(InpTargetProfit)) < 0.0000001)
+      g_targetAmt = MathAbs(GlobalVariableGet(g_gvBase + "_tgt"));
 
    for(int s = 0; s < 2; s++)
      {
@@ -2507,8 +2687,8 @@ void CreatePanel()
       return;
      }
 
-   MakeRect(OBJ_PREFIX + "bg", 0, 0, Px(W), Px(466), C'24,26,34', C'90,95,120');
-   MakeLabel(OBJ_PREFIX + "title", Px(6), Px(4), "裁量Nanpin v4.40", clrWhite, fs);
+   MakeRect(OBJ_PREFIX + "bg", 0, 0, Px(W), Px(492), C'24,26,34', C'90,95,120');
+   MakeLabel(OBJ_PREFIX + "title", Px(6), Px(4), "裁量Nanpin v4.50", clrWhite, fs);
    MakeButton(OBJ_PREFIX + "collapse", Px(W - 26), Px(2), Px(22), Px(20), "－", clrDimGray, clrWhite);
    SetTip(OBJ_PREFIX + "collapse", "パネルを折りたたむ（チャートを広く見る）");
    MakeLabel(OBJ_PREFIX + "status", Px(6), Px(24), "", clrLime, fs - 2);
@@ -2545,34 +2725,43 @@ void CreatePanel()
    MakeButton(ObjName("closeown", SIDE_SELL), Px(126), Px(258), Px(118), Px(22), "SELL 決済", C'90,40,40', clrWhite);
    MakeButton(ObjName("manual", SIDE_BUY),    Px(6),   Px(282), Px(118), Px(22), "BUY 成行グリッド", clrRoyalBlue, clrWhite);
    MakeButton(ObjName("closeown", SIDE_BUY),  Px(126), Px(282), Px(118), Px(22), "BUY 決済", C'40,50,100', clrWhite);
+   SetTip(ObjName("closeown", SIDE_SELL), "このEAのSELLポジションを全決済＋SELL指値を全削除（確認なしで即実行）");
+   SetTip(ObjName("closeown", SIDE_BUY), "このEAのBUYポジションを全決済＋BUY指値を全削除（確認なしで即実行）");
+
+//--- 目標利益
+   MakeLabel(OBJ_PREFIX + "tgtlbl", Px(6), Px(312), "目標利益", clrWhite, fs - 1);
+   MakeEdit(OBJ_PREFIX + "tgt", Px(62), Px(308), Px(78), Px(20), FormatPlain(g_targetAmt));
+   MakeLabel(OBJ_PREFIX + "tgtst", Px(144), Px(312), "", clrSilver, fs - 2);
+   SetTip(OBJ_PREFIX + "tgt", "目標利益（" + StringTrimLeftCopy(CurrencyUnit()) + "）：このEAの合計損益（SELL＋BUYの含み損益）がこの額に達したら、"
+          "全ポジション決済＋指値全削除。0でOFF");
 
 //--- レート予約（7th HEAVEN風）
-   MakeLabel(OBJ_PREFIX + "rstitle", Px(6), Px(310), "予約（到達で成行＋指値・Setで確定）", clrSilver, fs - 2);
+   MakeLabel(OBJ_PREFIX + "rstitle", Px(6), Px(336), "予約（到達で成行＋指値・Setで確定）", clrSilver, fs - 2);
    for(int s = 0; s < 2; s++)
      {
-      int   y  = (s == SIDE_SELL) ? Px(326) : Px(350);
+      int   y  = (s == SIDE_SELL) ? Px(352) : Px(376);
       color bg = (s == SIDE_SELL) ? clrCrimson : clrRoyalBlue;
       MakeButton(ObjName("rsside", s), Px(6), y, Px(30), Px(20), (s == SIDE_SELL ? "S" : "B"), bg, clrWhite);
       for(int r = 0; r < RES_SLOTS; r++)
          MakeEdit(ResBoxName(s, r), Px(40 + r * 68), y, Px(64), Px(20), RateText(g_resRate[s][r]));
      }
-   MakeButton(ObjName("rsdel", SIDE_SELL), Px(6),   Px(374), Px(46), Px(20), "S Del", C'240,170,170', clrBlack);
-   MakeButton(ObjName("rsdel", SIDE_BUY),  Px(54),  Px(374), Px(46), Px(20), "B Del", C'160,220,220', clrBlack);
-   MakeButton(OBJ_PREFIX + "rsclear",      Px(102), Px(374), Px(46), Px(20), "Clear", C'205,92,92', clrWhite);
-   MakeButton(OBJ_PREFIX + "rsplus",       Px(150), Px(374), Px(44), Px(20),
+   MakeButton(ObjName("rsdel", SIDE_SELL), Px(6),   Px(400), Px(46), Px(20), "S Del", C'240,170,170', clrBlack);
+   MakeButton(ObjName("rsdel", SIDE_BUY),  Px(54),  Px(400), Px(46), Px(20), "B Del", C'160,220,220', clrBlack);
+   MakeButton(OBJ_PREFIX + "rsclear",      Px(102), Px(400), Px(46), Px(20), "Clear", C'205,92,92', clrWhite);
+   MakeButton(OBJ_PREFIX + "rsplus",       Px(150), Px(400), Px(44), Px(20),
               StringFormat("+%.0f", InpTempWidth / g_pip), C'235,225,200', clrBlack);
-   MakeButton(OBJ_PREFIX + "rsset",        Px(196), Px(374), Px(48), Px(20), "Set", clrDodgerBlue, clrWhite);
+   MakeButton(OBJ_PREFIX + "rsset",        Px(196), Px(400), Px(48), Px(20), "Set", clrDodgerBlue, clrWhite);
    SetTip(ObjName("rsdel", SIDE_SELL), "SELLの予約を消去");
    SetTip(ObjName("rsdel", SIDE_BUY), "BUYの予約を消去");
    SetTip(OBJ_PREFIX + "rsclear", "予約をすべて消去");
    SetTip(OBJ_PREFIX + "rsplus", "空き枠に現在値±仮レート幅を入力（Setで確定）");
-   MakeLabel(OBJ_PREFIX + "rsstate", Px(6), Px(398), "", clrSilver, fs - 2);
+   MakeLabel(OBJ_PREFIX + "rsstate", Px(6), Px(424), "", clrSilver, fs - 2);
    DrawResLines();
 
 //--- 補足
-   MakeLabel(OBJ_PREFIX + "info1", Px(6), Px(414), "", clrSilver, fs - 2);
-   MakeLabel(OBJ_PREFIX + "info2", Px(6), Px(430), "", clrSilver, fs - 2);
-   MakeLabel(OBJ_PREFIX + "info3", Px(6), Px(446), "", clrSilver, fs - 2);
+   MakeLabel(OBJ_PREFIX + "info1", Px(6), Px(440), "", clrSilver, fs - 2);
+   MakeLabel(OBJ_PREFIX + "info2", Px(6), Px(456), "", clrSilver, fs - 2);
+   MakeLabel(OBJ_PREFIX + "info3", Px(6), Px(472), "", clrSilver, fs - 2);
   }
 
 //+------------------------------------------------------------------+
@@ -2739,6 +2928,19 @@ void RefreshPanel(const bool force)
       SetText(ObjName("rest", s), g_locked[s] ? "" : rest, clrSilver);
       ObjectSetInteger(0, ObjName("release", s), OBJPROP_TIMEFRAMES, g_locked[s] ? OBJ_ALL_PERIODS : OBJ_NO_PERIODS);
      }
+
+//--- 目標利益
+   if(g_flatActive)
+      SetText(OBJ_PREFIX + "tgtst", "一括決済中…", clrOrangeRed);
+   else
+      if(g_targetAmt <= 0)
+         SetText(OBJ_PREFIX + "tgtst", "OFF（0で無効）", clrDarkGray);
+      else
+        {
+         int    tn = 0;
+         double tp = OwnProfit(tn);   // 目標判定と同じ集計（このEAのポジションのみ）
+         SetText(OBJ_PREFIX + "tgtst", "あと" + FormatMoney(MathMax(0.0, g_targetAmt - tp)), tn > 0 ? clrGold : clrSilver);
+        }
 
 //--- レート予約の状態
    string rs = "";
