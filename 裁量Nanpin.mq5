@@ -1,6 +1,6 @@
 //+------------------------------------------------------------------+
 //|                                                 裁量Nanpin.mq5   |
-//|   裁量Nanpin  v4.72                                               |
+//|   裁量Nanpin  v4.73                                               |
 //|   ・レート予約：SELL／BUY 各3つの入力ボックス。到達で成行＋指値     |
 //|                                                                  |
 //|   【エントリー】                                                  |
@@ -29,7 +29,7 @@
 //|   ・銘柄のサフィックス有無（XAUUSD／XAUUSDx／XAUUSD-m 等）を同一視  |
 //+------------------------------------------------------------------+
 #property copyright "KOHI"
-#property version   "4.72"
+#property version   "4.73"
 //--- 説明文（#property description）は MetaEditor のプロジェクト（.mqproj）側の設定と
 //--- 重複して警告が出るため記載していません。使い方は設定ガイドを参照してください。
 
@@ -137,7 +137,7 @@ input double           InpPipSize           = 0;                  // 1pipsの価
 input bool             InpShowIndicators    = true;               // BBをチャートに表示
 
 input group "■ グリッド（7th HEAVEN風）"
-input double           InpLot               = 0.01;               // 1本あたりのロット
+input double           InpLot               = 0.01;               // 1本あたりのロットの初期値（パネルで随時変更可）
 input int              InpGridCount         = 10;                 // 指値の本数（成行1本＋指値○本）
 input double           InpGridStep          = 1.0;                // 指値の間隔（価格差・GOLDなら1.0＝1ドル）※ATR可変時は最小値
 input double           InpMicroTP           = 2.0;                // 微益利確幅（価格差）※ATR可変時は最小値
@@ -297,6 +297,7 @@ int               g_flatTries      = 0;
 ulong             g_flatStartMs    = 0;
 ulong             g_flatSendMs     = 0;
 double            g_targetAmt      = 0.0;              // 目標利益（0＝OFF）
+double            g_lot            = 0.01;             // 1本あたりのロット（パネルで変更可）
 
 int               g_failPrintCount = 0;
 string            g_lastEvent      = "";
@@ -421,6 +422,7 @@ int OnInit()
      }
    g_autoMode = InpAutoMode;
    g_targetAmt   = MathAbs(InpTargetProfit);
+   g_lot         = NormLot(InpLot);
    g_flatActive  = false;
 
    g_gvBase = "7HA_" + IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)) + "_" +
@@ -431,7 +433,7 @@ int OnInit()
 //--- 起動直後の足ではエントリーしない
    g_lastBarTime = iTime(_Symbol, g_entryTF, 0);
 
-   PrintFormat("%s起動 v4.72：口座通貨=%s／自動化=%s／方式=%s／エントリー足=%s／上位足=%s／SELL損切り=%s／BUY損切り=%s／監視Magic=%s／銘柄=%s",
+   PrintFormat("%s起動 v4.73：口座通貨=%s／自動化=%s／方式=%s／エントリー足=%s／上位足=%s／SELL損切り=%s／BUY損切り=%s／監視Magic=%s／銘柄=%s",
                LOG_TAG, g_currency, AutoModeText(g_autoMode), EntryModeText(), TFName(g_entryTF),
                (InpUseHTF ? TFName(InpHTF) : "OFF"),
                FormatMoney(g_slAmt[SIDE_SELL]), FormatMoney(g_slAmt[SIDE_BUY]),
@@ -528,6 +530,8 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam, const 
             ApplyEdit(s);
       if(sparam == OBJ_PREFIX + "tgt")
          ApplyTarget();
+      if(sparam == OBJ_PREFIX + "lot")
+         ApplyLot();
      }
 
    if(id == CHARTEVENT_OBJECT_CLICK)
@@ -1578,7 +1582,7 @@ bool PlaceGrid(const int side, const bool manual, const double limitLine = 0.0)
   {
    double step, tp;
    CalcWidths(step, tp);
-   double lot = NormLot(InpLot);
+   double lot = NormLot(g_lot);
 
 //--- 既存のポジション・指値には一切触れずに追加する
 
@@ -1812,6 +1816,29 @@ double OwnProfit(int &count)
 
 //+------------------------------------------------------------------+
 //| パネルの目標利益入力                                              |
+//+------------------------------------------------------------------+
+//| パネルのロット入力（これから出すグリッドに適用。既存の注文は変えない）|
+//+------------------------------------------------------------------+
+void ApplyLot()
+  {
+   string name = OBJ_PREFIX + "lot";
+   string txt  = ObjectGetString(0, name, OBJPROP_TEXT);
+   bool   ok   = false;
+   double v    = ParseAmount(txt, ok);
+   if(!ok || v <= 0)
+     {
+      SetAction("ロットとして読み取れません：" + txt + "（変更不可）");
+      ObjectSetString(0, name, OBJPROP_TEXT, DoubleToString(g_lot, 2));
+      return;
+     }
+   double nv = NormLot(v);
+   g_lot = nv;
+   SaveState();
+   ObjectSetString(0, name, OBJPROP_TEXT, DoubleToString(nv, 2));
+   string note = (MathAbs(nv - v) > 0.0000001) ? StringFormat("（%s を取引条件に合わせて調整）", txt) : "";
+   SetAction(StringFormat("ロットを %.2f に変更しました%s。次のエントリーから適用", nv, note));
+  }
+
 //+------------------------------------------------------------------+
 void ApplyTarget()
   {
@@ -2895,6 +2922,8 @@ void SaveState()
    GlobalVariableSet(g_gvBase + "_gseq", (double)g_gridSeq);
    GlobalVariableSet(g_gvBase + "_fold", g_collapsed ? 1.0 : 0.0);
    GlobalVariableSet(g_gvBase + "_tgtInit", MathAbs(InpTargetProfit));
+   GlobalVariableSet(g_gvBase + "_lotInit", InpLot);
+   GlobalVariableSet(g_gvBase + "_lot", g_lot);
    GlobalVariableSet(g_gvBase + "_tgt", g_targetAmt);
 //--- 再ブレイクの決済管理（再起動後も同じグリッドを管理し続ける）
    int nr = ArraySize(g_rbt);
@@ -2952,6 +2981,10 @@ void LoadState()
    if(GlobalVariableCheck(g_gvBase + "_tgtInit") && GlobalVariableCheck(g_gvBase + "_tgt") &&
       MathAbs(GlobalVariableGet(g_gvBase + "_tgtInit") - MathAbs(InpTargetProfit)) < 0.0000001)
       g_targetAmt = MathAbs(GlobalVariableGet(g_gvBase + "_tgt"));
+//--- ロット：入力の初期値を変えていなければ、パネルで変更した値を引き継ぐ
+   if(GlobalVariableCheck(g_gvBase + "_lotInit") && GlobalVariableCheck(g_gvBase + "_lot") &&
+      MathAbs(GlobalVariableGet(g_gvBase + "_lotInit") - InpLot) < 0.0000001 && GlobalVariableGet(g_gvBase + "_lot") > 0)
+      g_lot = NormLot(GlobalVariableGet(g_gvBase + "_lot"));
 
    ArrayResize(g_rbt, 0);
    int nr = GlobalVariableCheck(g_gvBase + "_rbtN") ? (int)GlobalVariableGet(g_gvBase + "_rbtN") : 0;
@@ -3405,8 +3438,8 @@ void CreatePanel()
       return;
      }
 
-   MakeRect(OBJ_PREFIX + "bg", 0, 0, Px(W), Px(492), C'24,26,34', C'90,95,120');
-   MakeLabel(OBJ_PREFIX + "title", Px(6), Px(4), "裁量Nanpin v4.72", clrWhite, fs);
+   MakeRect(OBJ_PREFIX + "bg", 0, 0, Px(W), Px(518), C'24,26,34', C'90,95,120');
+   MakeLabel(OBJ_PREFIX + "title", Px(6), Px(4), "裁量Nanpin v4.73", clrWhite, fs);
    MakeButton(OBJ_PREFIX + "collapse", Px(W - 26), Px(2), Px(22), Px(20), "－", clrDimGray, clrWhite);
    SetTip(OBJ_PREFIX + "collapse", "パネルを折りたたむ（チャートを広く見る）");
    MakeLabel(OBJ_PREFIX + "status", Px(6), Px(24), "", clrLime, fs - 2);
@@ -3453,33 +3486,39 @@ void CreatePanel()
    SetTip(OBJ_PREFIX + "tgt", "目標利益（" + StringTrimLeftCopy(CurrencyUnit()) + "）：このEAの合計損益（SELL＋BUYの含み損益）がこの額に達したら、"
           "全ポジション決済＋指値全削除。0でOFF");
 
+//--- ロット
+   MakeLabel(OBJ_PREFIX + "lotlbl", Px(6), Px(338), "ロット", clrWhite, fs - 1);
+   MakeEdit(OBJ_PREFIX + "lot", Px(62), Px(334), Px(78), Px(20), DoubleToString(g_lot, 2));
+   MakeLabel(OBJ_PREFIX + "lotst", Px(144), Px(338), "", clrSilver, fs - 2);
+   SetTip(OBJ_PREFIX + "lot", "1本あたりのロット：次のエントリー（成行・指値）から適用。既存のポジション・指値は変わりません");
+
 //--- レート予約（7th HEAVEN風）
-   MakeLabel(OBJ_PREFIX + "rstitle", Px(6), Px(336), "予約（到達で成行＋指値・Setで確定）", clrSilver, fs - 2);
+   MakeLabel(OBJ_PREFIX + "rstitle", Px(6), Px(362), "予約（到達で成行＋指値・Setで確定）", clrSilver, fs - 2);
    for(int s = 0; s < 2; s++)
      {
-      int   y  = (s == SIDE_SELL) ? Px(352) : Px(376);
+      int   y  = (s == SIDE_SELL) ? Px(378) : Px(402);
       color bg = (s == SIDE_SELL) ? clrCrimson : clrRoyalBlue;
       MakeButton(ObjName("rsside", s), Px(6), y, Px(30), Px(20), (s == SIDE_SELL ? "S" : "B"), bg, clrWhite);
       for(int r = 0; r < RES_SLOTS; r++)
          MakeEdit(ResBoxName(s, r), Px(40 + r * 68), y, Px(64), Px(20), RateText(g_resRate[s][r]));
      }
-   MakeButton(ObjName("rsdel", SIDE_SELL), Px(6),   Px(400), Px(46), Px(20), "S Del", C'240,170,170', clrBlack);
-   MakeButton(ObjName("rsdel", SIDE_BUY),  Px(54),  Px(400), Px(46), Px(20), "B Del", C'160,220,220', clrBlack);
-   MakeButton(OBJ_PREFIX + "rsclear",      Px(102), Px(400), Px(46), Px(20), "Clear", C'205,92,92', clrWhite);
-   MakeButton(OBJ_PREFIX + "rsplus",       Px(150), Px(400), Px(44), Px(20),
+   MakeButton(ObjName("rsdel", SIDE_SELL), Px(6),   Px(426), Px(46), Px(20), "S Del", C'240,170,170', clrBlack);
+   MakeButton(ObjName("rsdel", SIDE_BUY),  Px(54),  Px(426), Px(46), Px(20), "B Del", C'160,220,220', clrBlack);
+   MakeButton(OBJ_PREFIX + "rsclear",      Px(102), Px(426), Px(46), Px(20), "Clear", C'205,92,92', clrWhite);
+   MakeButton(OBJ_PREFIX + "rsplus",       Px(150), Px(426), Px(44), Px(20),
               StringFormat("+%.0f", InpTempWidth / g_pip), C'235,225,200', clrBlack);
-   MakeButton(OBJ_PREFIX + "rsset",        Px(196), Px(400), Px(48), Px(20), "Set", clrDodgerBlue, clrWhite);
+   MakeButton(OBJ_PREFIX + "rsset",        Px(196), Px(426), Px(48), Px(20), "Set", clrDodgerBlue, clrWhite);
    SetTip(ObjName("rsdel", SIDE_SELL), "SELLの予約を消去");
    SetTip(ObjName("rsdel", SIDE_BUY), "BUYの予約を消去");
    SetTip(OBJ_PREFIX + "rsclear", "予約をすべて消去");
    SetTip(OBJ_PREFIX + "rsplus", "空き枠に現在値±仮レート幅を入力（Setで確定）");
-   MakeLabel(OBJ_PREFIX + "rsstate", Px(6), Px(424), "", clrSilver, fs - 2);
+   MakeLabel(OBJ_PREFIX + "rsstate", Px(6), Px(450), "", clrSilver, fs - 2);
    DrawResLines();
 
 //--- 補足
-   MakeLabel(OBJ_PREFIX + "info1", Px(6), Px(440), "", clrSilver, fs - 2);
-   MakeLabel(OBJ_PREFIX + "info2", Px(6), Px(456), "", clrSilver, fs - 2);
-   MakeLabel(OBJ_PREFIX + "info3", Px(6), Px(472), "", clrSilver, fs - 2);
+   MakeLabel(OBJ_PREFIX + "info1", Px(6), Px(466), "", clrSilver, fs - 2);
+   MakeLabel(OBJ_PREFIX + "info2", Px(6), Px(482), "", clrSilver, fs - 2);
+   MakeLabel(OBJ_PREFIX + "info3", Px(6), Px(498), "", clrSilver, fs - 2);
   }
 
 //+------------------------------------------------------------------+
@@ -3600,7 +3639,7 @@ void RefreshPanel(const bool force)
    double step, tp;
    CalcWidths(step, tp);
    SetText(OBJ_PREFIX + "grid", StringFormat("成行1＋指値%d　間隔%s／微益%s　%.2flot", InpGridCount,
-                                             PriceText2(step), PriceText2(tp), NormLot(InpLot)), clrSilver);
+                                             PriceText2(step), PriceText2(tp), g_lot), clrSilver);
 
 //--- SELL／BUY
    for(int s = 0; s < 2; s++)
@@ -3661,6 +3700,9 @@ void RefreshPanel(const bool force)
          double tp = OwnProfit(tn);   // 目標判定と同じ集計（このEAのポジションのみ）
          SetText(OBJ_PREFIX + "tgtst", "あと" + FormatMoney(MathMax(0.0, g_targetAmt - tp)), tn > 0 ? clrGold : clrSilver);
         }
+
+//--- ロット
+   SetText(OBJ_PREFIX + "lotst", StringFormat("1グリッド最大 %.2flot", g_lot * (InpGridCount + 1)), clrSilver);
 
 //--- レート予約の状態
    string rs = "";
