@@ -1,6 +1,6 @@
 //+------------------------------------------------------------------+
 //|                                                 裁量Nanpin.mq5   |
-//|   裁量Nanpin  v4.70                                               |
+//|   裁量Nanpin  v4.71                                               |
 //|   ・レート予約：SELL／BUY 各3つの入力ボックス。到達で成行＋指値     |
 //|                                                                  |
 //|   【エントリー】                                                  |
@@ -29,7 +29,7 @@
 //|   ・銘柄のサフィックス有無（XAUUSD／XAUUSDx／XAUUSD-m 等）を同一視  |
 //+------------------------------------------------------------------+
 #property copyright "KOHI"
-#property version   "4.70"
+#property version   "4.71"
 //--- 説明文（#property description）は MetaEditor のプロジェクト（.mqproj）側の設定と
 //--- 重複して警告が出るため記載していません。使い方は設定ガイドを参照してください。
 
@@ -113,6 +113,7 @@ input ENUM_RB_TRAIL    InpRbTrailMode       = RB_TRAIL_ATR;       // 3)第1目�
 input double           InpRbTrailATR        = 1.0;                // 3)トレール幅：最も有利な価格からATR×この倍率
 input int              InpRbTrailBars       = 5;                  // 3)トレール：直近この本数の安値（SELLは高値）
 input int              InpRbTimeBars        = 20;                 // 4)時間切れ：エントリーからこの本数以内に第1目標へ届かなければ全決済（0＝OFF）
+input bool             InpRbFitGrid         = true;               // ナンピンの指値を損切りラインの内側に収める（間隔を自動調整・最小は指値の間隔）
 
 input group "■ エントリー足・ボリンジャーバンド"
 input ENUM_TIMEFRAMES  InpEntryTF           = PERIOD_CURRENT;     // エントリー足（PERIOD_CURRENT＝チャートの時間足）
@@ -439,7 +440,7 @@ int OnInit()
 //--- 起動直後の足ではエントリーしない
    g_lastBarTime = iTime(_Symbol, g_entryTF, 0);
 
-   PrintFormat("%s起動 v4.70：口座通貨=%s／自動化=%s／方式=%s／エントリー足=%s／上位足=%s／SELL損切り=%s／BUY損切り=%s／監視Magic=%s／銘柄=%s",
+   PrintFormat("%s起動 v4.71：口座通貨=%s／自動化=%s／方式=%s／エントリー足=%s／上位足=%s／SELL損切り=%s／BUY損切り=%s／監視Magic=%s／銘柄=%s",
                LOG_TAG, g_currency, AutoModeText(g_autoMode), EntryModeText(), TFName(g_entryTF),
                (InpUseHTF ? TFName(InpHTF) : "OFF"),
                FormatMoney(g_slAmt[SIDE_SELL]), FormatMoney(g_slAmt[SIDE_BUY]),
@@ -903,7 +904,8 @@ void RebreakSide(const int side, const double bid)
       if(ok)
         {
          Print(LOG_TAG + msg);
-         if(PlaceGrid(side, false))
+         double line = RbLimitLine(side, lvl, atr);
+         if(PlaceGrid(side, false, InpRbFitGrid ? line : 0.0))
             RbTradeAdd(g_gridSeq, side, lvl, g_rb[side].ext, atr, bid);
         }
       else
@@ -966,6 +968,15 @@ double RbStopLine(const int i)
   {
    double d = g_rbt[i].atr * InpRbStopATR;
    return(NormPrice(g_rbt[i].side == SIDE_BUY ? g_rbt[i].level - d : g_rbt[i].level + d));
+  }
+
+//+------------------------------------------------------------------+
+//| ナンピンを収めるライン：損切りライン（OFFなら無効ライン）            |
+//+------------------------------------------------------------------+
+double RbLimitLine(const int side, const double level, const double atr)
+  {
+   double d = atr * (InpRbStopATR > 0 ? InpRbStopATR : InpRbFailATR);
+   return(NormPrice(side == SIDE_BUY ? level - d : level + d));
   }
 
 //+------------------------------------------------------------------+
@@ -1568,8 +1579,11 @@ void CalcWidths(double &step, double &tp)
 
 //+------------------------------------------------------------------+
 //| グリッド発注：成行1本＋指値○本                                    |
+//|   limitLine > 0：指値をこのラインの内側（成行価格との間）に収める     |
+//|     間隔＝（成行価格〜ライン）÷（本数＋1）。ただし間隔は             |
+//|     InpGridStep 以上とし、収まらない分は本数を減らす                 |
 //+------------------------------------------------------------------+
-bool PlaceGrid(const int side, const bool manual)
+bool PlaceGrid(const int side, const bool manual, const double limitLine = 0.0)
   {
    double step, tp;
    CalcWidths(step, tp);
@@ -1595,8 +1609,26 @@ bool PlaceGrid(const int side, const bool manual)
    if(base <= 0)
       base = (side == SIDE_SELL) ? SymbolInfoDouble(_Symbol, SYMBOL_BID) : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
 
+//--- 範囲の制限（再ブレイク：損切りラインの内側に収める）
+   int  count   = InpGridCount;
+   bool limited = (limitLine > 0);
+   if(limited)
+     {
+      double range = (side == SIDE_SELL) ? limitLine - base : base - limitLine;
+      if(range <= 0)
+         count = 0;
+      else
+        {
+         step = NormPrice(MathMax(range / (InpGridCount + 1), InpGridStep));
+         if(step <= 0)
+            step = TickSize();
+         while(count > 0 && step * count >= range)
+            count--;   // 一番深い指値もラインの内側
+        }
+     }
+
    int placed = 0;
-   for(int k = 1; k <= InpGridCount; k++)
+   for(int k = 1; k <= count; k++)
      {
       double pr  = NormPrice(side == SIDE_SELL ? base + step * k : base - step * k);
       double ptp = NormPrice(side == SIDE_SELL ? pr - tp : pr + tp);
@@ -1619,8 +1651,10 @@ bool PlaceGrid(const int side, const bool manual)
    string msg = StringFormat("【%s】%sエントリー #%d：成行 %.2f lot @%s ＋ 指値%d本（間隔 %s／微益 %s／ATR %s）",
                              SideName(side), (manual ? "裁量" : "自動"), gid, lot, PriceText(base), placed,
                              PriceText2(step), PriceText2(tp), (atr == EMPTY_VALUE ? "-" : PriceText2(atr)));
-   if(placed < InpGridCount)
-      msg += StringFormat("　※指値%d本が発注失敗（エキスパートタブ参照）", InpGridCount - placed);
+   if(limited)
+      msg += StringFormat("　※指値は損切りライン %s の内側に%d本", PriceText(limitLine), count);
+   if(placed < count)
+      msg += StringFormat("　※指値%d本が発注失敗（エキスパートタブ参照）", count - placed);
    SetAction(msg);          // 通知はしない（ログとパネル表示のみ）
    return(true);
   }
@@ -3384,7 +3418,7 @@ void CreatePanel()
      }
 
    MakeRect(OBJ_PREFIX + "bg", 0, 0, Px(W), Px(492), C'24,26,34', C'90,95,120');
-   MakeLabel(OBJ_PREFIX + "title", Px(6), Px(4), "裁量Nanpin v4.70", clrWhite, fs);
+   MakeLabel(OBJ_PREFIX + "title", Px(6), Px(4), "裁量Nanpin v4.71", clrWhite, fs);
    MakeButton(OBJ_PREFIX + "collapse", Px(W - 26), Px(2), Px(22), Px(20), "－", clrDimGray, clrWhite);
    SetTip(OBJ_PREFIX + "collapse", "パネルを折りたたむ（チャートを広く見る）");
    MakeLabel(OBJ_PREFIX + "status", Px(6), Px(24), "", clrLime, fs - 2);
